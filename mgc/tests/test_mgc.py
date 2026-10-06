@@ -172,7 +172,7 @@ class Extensibility(unittest.TestCase):
 
     def _x3(self, alloc):
         s = _read(OS, 'mm_os_explicit.mgc').replace('Z = l2(', self.X3[0], 1).replace(
-            self.X3[1], self.X3[1] + '\n        q = L1.single_buffer(' + alloc + ')\n        dma.load(q, ' + alloc + ').wait()', 1)
+            self.X3[1], self.X3[1] + '\n        q = L1.single_buffer(' + alloc + ')\n        idma.load(q, ' + alloc + ').wait()', 1)
         return _c(OS, 'x.mgc', s)
 
     def test_rank_limit_from_capabilities(self):
@@ -232,11 +232,11 @@ class Errors(unittest.TestCase):
         self.assertError('X[tile_h, 0:t_size], depth=2', 'X[tile_h, 0:t_size:2], depth=2', 'unit step')
 
     def test_l1_to_l1(self):
-        self.assertError('ey = dma.load(y, Y[tile_h, tile_w])', 'ey = dma.load(y, x[0])', 'L1->L1')
+        self.assertError('ey = idma.load(y, Y[tile_h, tile_w])', 'ey = idma.load(y, x[0])', 'L1->L1')
 
     def test_dma_shape_mismatch(self):
-        self.assertError('ex = dma.load(x[0], X[tile_h, 0:t_size])',
-                         'ex = dma.load(x[0], X[tile_h, 0:2 * t_size])', 'shape mismatch')
+        self.assertError('ex = idma.load(x[0], X[tile_h, 0:t_size])',
+                         'ex = idma.load(x[0], X[tile_h, 0:2 * t_size])', 'shape mismatch')
 
     def test_gemm_shape_mismatch(self):
         self.assertError('redmule.enqueue(x[0], w[0], y,', 'redmule.enqueue(w[0], x[0], y,', 'shapes do not match')
@@ -253,7 +253,7 @@ class Errors(unittest.TestCase):
     def test_unwaited_event_reuse(self):
         self.assertError('            ex.wait()\n            ew.wait()\n            ey.wait()\n',
                          '            ew.wait()\n            ey.wait()\n'
-                         '            ex = dma.load(x[1], X[tile_h, t_size:2 * t_size])\n',
+                         '            ex = idma.load(x[1], X[tile_h, t_size:2 * t_size])\n',
                          'was not waited')
 
     def test_wait_never_issued(self):
@@ -262,19 +262,100 @@ class Errors(unittest.TestCase):
                          'never issued')
 
     def test_bad_slot_offset(self):
-        self.assertError('ex = dma.load(x[i + 1],', 'ex = dma.load(x[i + 3],', '|k| < 2')
+        self.assertError('ex = idma.load(x[i + 1],', 'ex = idma.load(x[i + 3],', '|k| < 2')
 
     def test_after_is_gone(self):
         self.assertError('redmule.gemm(x[i], w[i], y)', 'redmule.gemm(x[i], w[i], y, after=(ey,))',
                          'inferred', src='mm_os.mgc')
 
     def test_remote_load_rejected(self):
-        self.assertError('dma.load(x[pt], X[pt * t_size:(pt + 1) * t_size, tile_h])',
-                         'dma.load(x[pt], x.on(1, 0)[pt])', 'L1->L1', d=WS, src='mm_ws.mgc')
+        self.assertError('idma.load(x[pt], X[pt * t_size:(pt + 1) * t_size, tile_h])',
+                         'idma.load(x[pt], x.at_rel(1, 0)[pt])', 'L1->L1', d=WS, src='mm_ws.mgc')
 
     def test_unknown_size(self):
         self.assertError('sizes("M_SIZE", "N_SIZE", "K_SIZE")', 'sizes("M_SIZE", "N_SIZE", "Q_SIZE")',
                          'not #defined')
+
+
+class RemoteTargets(unittest.TestCase):
+    """L1 -> L1 stores to other tiles: relative, absolute, row/column multicast."""
+
+    REL = 'idma.store(y.at_rel(1, 0)[pt], y[pt])'
+    MCAST = '''from mgc import *
+
+M, N, K = sizes("M_SIZE", "N_SIZE", "K_SIZE")
+X = l2("x_inp", (M, N), fp16)
+W = l2("w_inp", (N, K), fp16)
+Y = l2("y_inp", (M, K), fp16)
+
+@test("test_mcast")
+def main():
+    for y_id, x_id in tiles():
+        tile_h = y_id.split(M)
+        tile_w = x_id.split(K)
+        x = L1.single_buffer(X[tile_h, :])
+        w = L1.single_buffer(W[:, tile_w])
+        y = L1.single_buffer(Y[tile_h, tile_w])
+        if x_id == y_id:
+            idma.load(x, X[tile_h, :]).wait()
+            idma.store(x.row, x).wait()
+        if y_id == 0:
+            idma.load(w, W[:, tile_w]).wait()
+            idma.store(w.col[0], w[0]).wait()
+        sync(GLOBAL)
+        idma.load(y, Y[tile_h, tile_w]).wait()
+        redmule.gemm(x, w, y)
+        idma.store(Y[tile_h, tile_w], y).wait()
+'''
+
+    def ws(self, new):
+        src = _read(WS, 'mm_ws.mgc')
+        self.assertIn(self.REL, src)
+        return _c(WS, 'x.mgc', src.replace(self.REL, new))
+
+    def test_absolute_tile(self):
+        c = self.ws('idma.store(y.at(y_id + 1, x_id)[pt], y[pt])')
+        self.assertIn('get_l1_base(GET_ID(y_id + 1, x_id)) + (y_pt_prev - l1_tile_base),', c)
+        self.assertNotIn('l1_base_s', c)
+        self.assertIn('l1_addr_x_0 = l1_addr_w + (tile_h_max * tile_w_max * 2);', c)  # uniform layout
+        self.assertNotIn('mg_redmule_gemm_enqueue', c)  # y is written by another tile
+
+    def test_row_and_col_multicast_lowered_to_unicasts(self):
+        c = _c(OS, 'x.mgc', self.MCAST)
+        self.assertIn('for (uint32_t mcast_x = 0; mcast_x < MESH_X_TILES; mcast_x++) {', c)
+        self.assertIn('if (mcast_x != x_id) {', c)
+        self.assertIn('get_l1_base(GET_ID(y_id, mcast_x)) + (l1_addr_x - l1_tile_base),', c)
+        self.assertIn('for (uint32_t mcast_w = 0; mcast_w < MESH_Y_TILES; mcast_w++) {', c)
+        self.assertIn('if (mcast_w != y_id) {', c)
+        self.assertIn('get_l1_base(GET_ID(mcast_w, x_id)) + (l1_addr_w - l1_tile_base),', c)
+        # one wait covers all the unicasts (same-direction transfers complete in order)
+        self.assertEqual(c.count('mg_idma_wait(&eu_ctrl, 1, WAIT_MODE, &idma_evt_x);'), 1)
+        self.assertIn('l1_addr_w = l1_addr_x + (tile_h_max * N_SIZE * 2);', c)  # uniform layout
+
+    def test_native_multicast_is_a_table_change(self):
+        caps = devices.IdmaCaps(max_rank=2, l1_strided=False, functions=devices.IDMA.functions,
+                                multicast={'ROW': 'mg_idma_memcpy_row_mcast'})
+        with mock.patch.object(devices, 'IDMA', caps):
+            c = _c(OS, 'x.mgc', self.MCAST)
+        self.assertNotIn('mcast_x', c)
+        self.assertIn('mg_idma_memcpy_row_mcast(', c)
+        self.assertIn('mcast_w < MESH_Y_TILES', c)  # COL is still lowered
+
+    def test_multicast_slot_must_match(self):
+        src = self.MCAST.replace('idma.store(w.col[0], w[0])', 'idma.store(x.col, w)')
+        with self.assertRaisesRegex(MgcError, 'same buffer on another tile'):
+            _c(OS, 'x.mgc', src)
+
+    def test_multicast_is_not_a_load_source(self):
+        src = self.MCAST.replace('idma.store(x.row, x)', 'idma.load(x, x.row)')
+        with self.assertRaisesRegex(MgcError, 'L1->L1'):
+            _c(OS, 'x.mgc', src)
+
+    def test_old_names_rejected(self):
+        with self.assertRaisesRegex(MgcError, 'renamed `buf.at_rel'):
+            self.ws('idma.store(y.on(1, 0)[pt], y[pt])')
+        with self.assertRaisesRegex(MgcError, 'renamed `idma`'):
+            self.ws('dma.store(y.at_rel(1, 0)[pt], y[pt])')
 
 
 class TopFunction(unittest.TestCase):

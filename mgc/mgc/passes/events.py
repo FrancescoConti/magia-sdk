@@ -75,16 +75,16 @@ class _Analysis:
 
     def note(self, st):
         """Record buffers whose load and store events are pending at once."""
-        bufs = {k[1] for k, v in st.items() if k[0] == 'dma' and v != N}
+        bufs = {k[1] for k, v in st.items() if k[0] == 'idma' and v != N}
         for b in bufs:
-            if st.get(('dma', b, 0), N) != N and st.get(('dma', b, 1), N) != N:
+            if st.get(('idma', b, 0), N) != N and st.get(('idma', b, 1), N) != N:
                 self.overlap.add(b)
 
     def issue(self, op, st, e):
         """Mark `e` pending in `st`; error if it already certainly is."""
         k = self.key(e, op)
         if st.get(k, N) == P:
-            what = f'`{e.name}`' + (' (out)' if e.dir == 1 else '') if e.kind == 'dma' else f'`{e.name}`'
+            what = f'`{e.name}`' + (' (out)' if e.dir == 1 else '') if e.kind == 'idma' else f'`{e.name}`'
             raise MgcError(op, f'a previous transfer/job on {what} was not waited before reusing its event')
         st[k] = P
         self.note(st)
@@ -94,7 +94,7 @@ class _Analysis:
         block always ends in `continue`). `if` branches are merged, loops are
         walked twice to catch events left pending across iterations."""
         for op in ops:
-            if isinstance(op, ir.DmaOp):
+            if isinstance(op, ir.IdmaOp):
                 self.issue(op, st, op.event.data)
             elif isinstance(op, ir.HwpeOp) and op.action.data in ('enqueue', 'oneshot'):
                 self.issue(op, st, op.event.data)
@@ -170,7 +170,7 @@ class EventAlloc(ModulePass):
         an.run(tiles.body.block.ops, {})
 
         def cname(e: ir.EvtRef):
-            if e.kind == 'dma':
+            if e.kind == 'idma':
                 base = f'idma_evt_{e.name}'
                 if e.name in an.overlap:
                     base += '_in' if e.dir == 0 else '_out'

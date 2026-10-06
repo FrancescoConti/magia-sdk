@@ -66,10 +66,10 @@ def main():
         for z in range(N_ITERATIONS):
             # TIMESLOT t = -1
             # Initial static weight load
-            dma.load(w, W[tile_h, tile_w]).wait()
+            idma.load(w, W[tile_h, tile_w]).wait()
 
             # First input load
-            dma.load(x[0], X[0:t_size, tile_h]).wait()
+            idma.load(x[0], X[0:t_size, tile_h]).wait()
 
             sync(GLOBAL)
 
@@ -93,19 +93,19 @@ def main():
                 3c. Load L2 output of current timeslot (if upmost tile)
                 """
                 if y_id == 0 and t < t_end:
-                    dma.load(y[pt], Y[pt * t_size:(pt + 1) * t_size, tile_w]).wait()
+                    idma.load(y[pt], Y[pt * t_size:(pt + 1) * t_size, tile_w]).wait()
 
                 """
                 3d. Load the next input, push the previous output down (or to L2), compute
                 the current output.
                 """
                 if pt < timeslots - 1:
-                    ex = dma.load(x[pt + 1], X[(pt + 1) * t_size:(pt + 2) * t_size, tile_h])
+                    ex = idma.load(x[pt + 1], X[(pt + 1) * t_size:(pt + 2) * t_size, tile_h])
                 if pt > 0:
                     if y_id == MESH_Y_TILES - 1:
-                        eo = dma.store(Y[(pt - 1) * t_size:pt * t_size, tile_w], y[pt - 1])
+                        eo = idma.store(Y[(pt - 1) * t_size:pt * t_size, tile_w], y[pt - 1])
                     else:
-                        eo = dma.store(y.on(1, 0)[pt - 1], y[pt - 1])
+                        eo = idma.store(y.at_rel(1, 0)[pt - 1], y[pt - 1])
                 if pt < timeslots:
                     job = redmule.gemm(x[pt], w, y[pt])
 

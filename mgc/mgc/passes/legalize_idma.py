@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Francesco Conti <f.conti@unibo.it>
-"""legalize-dma: tensor views -> iDMA transfers.
+"""legalize-idma: tensor views -> iDMA transfers.
 
 The only pass that knows the iDMA's capabilities (devices.IDMA). A view is
 turned into a contiguous run of `len` bytes repeated over outer dimensions
@@ -11,7 +11,7 @@ turned into a contiguous run of `len` bytes repeated over outer dimensions
 inner neighbour. The result must fit `IDMA.max_rank`; the L1 side is dense.
 
 Each mg.alloc gets the geometry of its declaration view (`xfer`) and its
-base L2 address (`axi`). Each mg.dma is checked against its buffer's geometry
+base L2 address (`axi`). Each mg.idma is checked against its buffer's geometry
 and gets its L2 address as the buffer's base plus an offset.
 """
 
@@ -82,15 +82,15 @@ def base_addr(view: ir.View, t) -> BinOp:
 
 
 @dataclass(frozen=True)
-class LegalizeDma(ModulePass):
-    """Gives every `mg.alloc` and `mg.dma` its transfer geometry and L2 address.
+class LegalizeIdma(ModulePass):
+    """Gives every `mg.alloc` and `mg.idma` its transfer geometry and L2 address.
 
     Example: `x = L1.single_buffer(X[0:8, 0:16])` gets a 2-D `xfer` and base address
-    `l2_addr_x`; a later `dma.load(x, X[8:16, 0:16])` is checked to have the same
+    `l2_addr_x`; a later `idma.load(x, X[8:16, 0:16])` is checked to have the same
     geometry and gets address `l2_addr_x + (8 * N * 2)`. A load with a different
     geometry or shape than the buffer's declaration is an `MgcError`.
     """
-    name = 'legalize-dma'
+    name = 'legalize-idma'
 
     def apply(self, ctx, module):
         ts = tensors(module)
@@ -100,11 +100,11 @@ class LegalizeDma(ModulePass):
                 t = ts[v.tensor]
                 op.attributes['xfer'] = ir.XferAttr(geometry(op, v, t))
                 op.attributes['axi'] = ir.E(base_addr(v, t))
-            elif isinstance(op, ir.DmaOp):
-                self.dma(op, ts)
+            elif isinstance(op, ir.IdmaOp):
+                self.idma(op, ts)
 
-    def dma(self, op, ts):
-        """Check and annotate one `mg.dma`: neighbour stores are dense copies of
+    def idma(self, op, ts):
+        """Check and annotate one `mg.idma`: neighbour stores are dense copies of
         the whole buffer; L2 transfers must match the buffer's declared shape and
         geometry, and get the L2 address as base plus per-dimension offset."""
         a = alloc_of(op.local)

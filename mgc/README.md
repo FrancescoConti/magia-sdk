@@ -69,16 +69,16 @@ for y_id, x_id in tiles():
     y = L1.multi_buffer(Y[0:t_size, tile_w], depth=3)
 
     for z in range(N_ITERATIONS):
-        dma.load(w, W[tile_h, tile_w]).wait()
+        idma.load(w, W[tile_h, tile_w]).wait()
         for pt in pipeline(timeslots, skew=t_start, steps=total_timeslots, sync=GLOBAL):
             if y_id == 0:
-                dma.load(y[pt], Y[pt * t_size:(pt + 1) * t_size, tile_w])
-            dma.load(x[pt], X[pt * t_size:(pt + 1) * t_size, tile_h])
+                idma.load(y[pt], Y[pt * t_size:(pt + 1) * t_size, tile_w])
+            idma.load(x[pt], X[pt * t_size:(pt + 1) * t_size, tile_h])
             redmule.gemm(x[pt], w, y[pt])                 # y += x @ w
             if y_id == MESH_Y_TILES - 1:
-                dma.store(Y[pt * t_size:(pt + 1) * t_size, tile_w], y[pt])
+                idma.store(Y[pt * t_size:(pt + 1) * t_size, tile_w], y[pt])
             else:
-                dma.store(y.on(1, 0)[pt], y[pt])          # same slot, tile below
+                idma.store(y.at_rel(1, 0)[pt], y[pt])          # same slot, tile below
 
     sync(COL)
     if y_id == MESH_Y_TILES - 1:
@@ -134,20 +134,29 @@ tile split, or an integer expression (which removes the dimension).
 |---|---|
 | `b = L1.single_buffer(view)` | dense L1 buffer with the view's shape; the view also fixes the transfer geometry |
 | `b = L1.multi_buffer(view, depth=N)` | `N` L1 buffers (*slots*, `N` ≥ 2 and constant), each shaped like `view`, used for double/triple buffering: e.g. load the next tile into one slot while an accelerator reads the current one. `b` itself is not an operand; it must be indexed to pick a slot. `b[c]` with a constant `c` (e.g. `b[0]`) is always the same, fixed slot. `b[v + k]`, where `v` is a loop variable and `k` a constant offset with \|k\| < N, is a *rotating* slot: the slot used changes with `v` (it is slot `(v + k) % N`), so `b[i]` and `b[i + 1]` mean "current" and "next" in iteration `i`. |
-| `b.on(dy, dx)[k]` | The copy of buffer `b` that lives in the L1 of a **neighbour tile**, i.e. the tile at `(y_id + dy, x_id + dx)`; `dy` and `dx` must be constants (e.g. `b.on(0, 1)` is the tile to the right, `b.on(1, 0)` the one below). Every tile allocates `b` at the same L1 offset, so the neighbour's copy is found at the neighbour's L1 base plus the local offset. `[k]` picks a slot as for a local multi-buffer (omit it if `b` has a single slot). It can only be used as the destination of `dma.store`, to push a local buffer to a neighbour: `dma.store(b.on(0, 1)[k], b[k])` copies local slot `k` of `b` into the same slot of `b` on the tile to the right. Source and destination must be the same buffer and the same slot. |
+| `b.at_rel(dy, dx)[k]` | The copy of buffer `b` that lives in the L1 of a **neighbour tile**, i.e. the tile at `(y_id + dy, x_id + dx)`; `dy` and `dx` must be constants (e.g. `b.at_rel(0, 1)` is the tile to the right, `b.at_rel(1, 0)` the one below). Every tile allocates `b` at the same L1 offset, so the neighbour's copy is found at the neighbour's L1 base plus the local offset. `[k]` picks a slot as for a local multi-buffer (omit it if `b` has a single slot). It can only be used as the destination of `idma.store`, to push a local buffer to a neighbour: `idma.store(b.at_rel(0, 1)[k], b[k])` copies local slot `k` of `b` into the same slot of `b` on the tile to the right. Source and destination must be the same buffer and the same slot. |
+| `b.at(y, x)[k]` | As `b.at_rel`, but on the tile with **absolute** coordinates `(y, x)`, which can be any integer expressions, including run-time ones (e.g. `b.at(y_id, 0)`, the first tile of this row). The tile's L1 base is computed where the transfer is issued (`get_l1_base(GET_ID(y, x))`). |
+| `b.row[k]`, `b.col[k]` | **Multicast**: the copies of `b` on every *other* tile of this tile's row (`row`) or column (`col`). Same rules as `b.at_rel`: `idma.store(b.row[k], b[k])` copies local slot `k` into slot `k` of `b` on all the other tiles of the row. |
 
 ### Transfers and events
 
 | Statement | Meaning |
 |---|---|
-| `e = dma.load(slot, view)` | asynchronous L2 → L1 |
-| `e = dma.store(view, slot)` | asynchronous L1 → L2 |
-| `e = dma.store(b.on(dy, dx)[k], b[k])` | asynchronous L1 → neighbour's L1, same slot |
+| `e = idma.load(slot, view)` | asynchronous L2 → L1 |
+| `e = idma.store(view, slot)` | asynchronous L1 → L2 |
+| `e = idma.store(b.at_rel(dy, dx)[k], b[k])` | asynchronous L1 → neighbour's L1, same slot |
+| `e = idma.store(b.at(y, x)[k], b[k])` | asynchronous L1 → L1 of tile `(y, x)`, same slot |
+| `e = idma.store(b.row[k], b[k])`, `b.col[k]` | asynchronous L1 → L1 of every other tile of the row / column, same slot |
 | `e.wait()` | wait for the transfer |
 
 Allowed transfers follow `devices.IDMA`. After merging contiguous dimensions, a transfer is at
 most `max_rank`-dimensional (currently 2: `mg_idma_memcpy_1d/2d`), with unit steps and a dense
 L1 side. L1→L1 within a tile and L2→L2 are rejected.
+
+Row/column multicasts are lowered by `idma-mcast` to one unicast per destination tile (a `for` over
+`MESH_X_TILES`/`MESH_Y_TILES` that skips the issuing tile), all on the same event: same-direction
+iDMA transfers complete in issue order, so one `e.wait()` waits for all of them. Once the iDMA
+supports multicast in hardware, an `IDMA.multicast` entry makes it a single call.
 
 Each L1 buffer has one event per direction (`idma_evt_<buf>_in/_out`). The two are merged into
 `idma_evt_<buf>` when they are never pending at the same time. The following are compile errors:
@@ -224,7 +233,7 @@ pipelines. A fixed sequence of passes then lowers that intent to low-level detai
 and the last stage prints C against mglib. Each pass can be inspected on its own with `--print-ir-after`.
 
 ```
-.mgc → frontend → legalize-dma → pipeline → job-lower → multi-buffer → l1-layout → event-alloc → emit-c → clang-format
+.mgc → frontend → legalize-idma → pipeline → job-lower → multi-buffer → l1-layout → event-alloc → idma-mcast → emit-c → clang-format
 ```
 
 `mgc` also assists the MAGIA programmer by taking some decisions autonomously and rejecting some
@@ -256,11 +265,11 @@ def main():
         x = L1.single_buffer(X[tile_h, :])
         w = L1.single_buffer(W[:, tile_w])
         y = L1.single_buffer(Y[tile_h, tile_w])
-        dma.load(x, X[tile_h, :])
-        dma.load(w, W[:, tile_w])
-        dma.load(y, Y[tile_h, tile_w]).wait()
+        idma.load(x, X[tile_h, :])
+        idma.load(w, W[:, tile_w])
+        idma.load(y, Y[tile_h, tile_w]).wait()
         redmule.gemm(x, w, y)
-        dma.store(Y[tile_h, tile_w], y).wait()
+        idma.store(Y[tile_h, tile_w], y).wait()
 ```
 
 The 14 source lines become about 130 lines of C (excerpt):
@@ -279,7 +288,7 @@ mg_redmule_gemm(&redmule_ctrl, &eu_ctrl, WAIT_MODE, l1_addr_x, l1_addr_w, l1_add
                 (uint16_t)tile_h, (uint16_t)N_SIZE, (uint16_t)tile_w, &redmule_evt, NULL);
 ```
 
-The `W[:, tile_w]` column block is not contiguous in L2, so `legalize-dma` turns it into a 2-D
+The `W[:, tile_w]` column block is not contiguous in L2, so `legalize-idma` turns it into a 2-D
 transfer, while `X[tile_h, :]` is contiguous and stays 1-D. The GEMM dimensions come from the
 buffer shapes, and the `tile_h`/`tile_w` borders handle meshes that do not divide the problem.
 To see the intermediate steps, run `mgcc.py tiny.mgc --print-ir-after=frontend` (or any pass name).
@@ -310,12 +319,13 @@ IR conventions:
 
 | Pass | Job |
 |---|---|
-| `legalize-dma` | views → N-dimensional transfers, checked against `devices.IDMA`; base and per-transfer L2 addresses |
+| `legalize-idma` | views → N-dimensional transfers, checked against `devices.IDMA`; base and per-transfer L2 addresses |
 | `pipeline` | `mg.pipeline` → explicit guarded schedule: stages, depth check, job protocol |
 | `job-lower` | `mg.job` → RedMulE one-shot or CV32 call; parameters and shape checks from the descriptors |
 | `multi-buffer` | slot indices → static addresses or rotating pointers with an `if`/`switch` selection |
 | `l1-layout` | identical L1 layout on all tiles; uses `*_max` tile sizes when buffers are accessed remotely; neighbour L1 bases |
 | `event-alloc` | event variable names; dataflow check of issue/wait |
+| `idma-mcast` | row/column multicasts → loops of unicast transfers, unless `devices.IDMA.multicast` lists the scope |
 | `emit-c` | prints C; each buffer's `len_/std_/reps_/l1_addr_/l2_addr_` is declared once and referenced by name |
 
 Extending:
@@ -323,6 +333,7 @@ Extending:
 | To add | Change |
 |---|---|
 | an iDMA mode (3-D, ...) | `IDMA.max_rank` and `IDMA.functions` in `devices.py` |
+| hardware row/column multicast | `IDMA.multicast` in `devices.py` (scope → mglib function) |
 | an HWPE accelerator | an `Hwpe` entry in `devices.py` (operands, parameters, constraints, queue depth, function names) and its mglib wrapper |
 | a software kernel | `l1_kernel(...)` in the `.mgc` file and the C function |
 | Spatz / PULP offload | an asynchronous executor (needs an mglib layer first) |
@@ -369,3 +380,5 @@ Extending:
 - The event check accepts code that is valid on at least one path, so it can miss errors that
   depend on correlated conditions.
 - The generated tests do not support `STALLING=1`.
+- Multicasts are lowered to unicast transfers. On a 1-wide row/column nothing is transferred, so
+  waiting on the multicast's event is invalid there.

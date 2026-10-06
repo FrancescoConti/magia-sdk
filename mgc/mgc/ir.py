@@ -80,9 +80,9 @@ class Xfer:
 class EvtRef:
     """Event storage: a DMA event (per buffer and direction), an accelerator's
     default event, or an element of an event array."""
-    kind: str  # 'dma' | 'hwpe' | 'array'
+    kind: str  # 'idma' | 'hwpe' | 'array'
     name: str  # buffer name | accelerator | array name
-    dir: Optional[int] = None  # dma only
+    dir: Optional[int] = None  # idma only
     index: Optional[Expr] = None  # array only
     cname: Optional[str] = None  # resolved C pointer expression (event-alloc / multi-buffer)
 
@@ -286,7 +286,7 @@ class ScalarOp(IRDLOperation):
 @irdl_op_definition
 class AllocOp(IRDLOperation):
     """L1 buffer with `depth` slots, shaped like `view` (which also fixes its
-    transfer geometry). legalize-dma adds `xfer`, l1-layout adds `addrs`."""
+    transfer geometry). legalize-idma adds `xfer`, l1-layout adds `addrs`."""
     name = 'mg.alloc'
     sym = attr_def(StringAttr)
     view = attr_def(ViewAttr)
@@ -299,12 +299,18 @@ class AllocOp(IRDLOperation):
 
 @irdl_op_definition
 class RemoteOp(IRDLOperation):
-    """The same allocation on the tile at (y_id + dy, x_id + dx)."""
+    """The same allocation on other tile(s), by `mode`:
+    `rel`: the tile at (y_id + dy, x_id + dx), constant offsets;
+    `abs`: the tile at (ty, tx), any integer expressions;
+    `row` / `col`: every other tile of this tile's row / column (multicast)."""
     name = 'mg.remote'
     buf = operand_def(BufType)
-    dy = attr_def(ExprAttr)
-    dx = attr_def(ExprAttr)
-    base = opt_attr_def(StringAttr)  # neighbour L1 base variable (l1-layout)
+    mode = attr_def(StringAttr)  # 'rel' | 'abs' | 'row' | 'col'
+    dy = opt_attr_def(ExprAttr)  # rel
+    dx = opt_attr_def(ExprAttr)  # rel
+    ty = opt_attr_def(ExprAttr)  # abs
+    tx = opt_attr_def(ExprAttr)  # abs
+    base = opt_attr_def(StringAttr)  # neighbour L1 base variable (l1-layout, rel only)
     res = result_def(BufType)
 
 
@@ -357,18 +363,18 @@ class PipelineOp(_Region):
 
 
 @irdl_op_definition
-class DmaOp(IRDLOperation):
+class IdmaOp(IRDLOperation):
     """iDMA transfer between a local L1 slot and either an L2 view or the same
-    slot on a neighbour tile (`remote`). dir 0: into L1, 1: out of L1."""
-    name = 'mg.dma'
+    slot on other tile(s) (`remote`, see `mg.remote`). dir 0: into L1, 1: out of L1."""
+    name = 'mg.idma'
     local = operand_def(BufType)
     remote = opt_operand_def(BufType)
     dir = attr_def(IntAttr)
     slot = attr_def(ExprAttr)
     l2 = opt_attr_def(ViewAttr)
     event = attr_def(EvtAttr)
-    xfer = opt_attr_def(XferAttr)  # legalize-dma
-    axi = opt_attr_def(ExprAttr)  # legalize-dma: L2-side address
+    xfer = opt_attr_def(XferAttr)  # legalize-idma
+    axi = opt_attr_def(ExprAttr)  # legalize-idma: L2-side address
     addr = opt_attr_def(StringAttr)  # multi-buffer: local slot address
 
 
@@ -445,6 +451,6 @@ class CheckOp(IRDLOperation):
 
 MG = Dialect('mg', [
     TensorOp, DefineOp, KernelOp, FuncOp, TilesOp, CommentOp, SplitOp, ScalarOp, AllocOp, RemoteOp,
-    EventsOp, ForOp, IfOp, ContinueOp, PipelineOp, DmaOp, JobOp, HwpeOp, CallOp, WaitOp, SyncOp,
+    EventsOp, ForOp, IfOp, ContinueOp, PipelineOp, IdmaOp, JobOp, HwpeOp, CallOp, WaitOp, SyncOp,
     SelectOp, CheckOp
 ], [ExprAttr, ViewAttr, XferAttr, EvtAttr, SelectAttr, BufType])

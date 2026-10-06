@@ -54,7 +54,7 @@ def main():
         TEST LOOP - REPEAT THE TEST N_ITERATION TIMES.
         """
         for z in range(N_ITERATIONS):
-            dma.load(x, X[tile_h, tile_w]).wait()
+            idma.load(x, X[tile_h, tile_w]).wait()
 
             """
             3. Systolic pipeline over the output blocks: load the weight block (and, on the left
@@ -63,13 +63,13 @@ def main():
             """
             for pt in pipeline(timeslots, skew=t_start, steps=total_timeslots, sync=ROW):
                 if x_id == 0:
-                    dma.load(y[pt], Y[tile_h, pt * t_size:(pt + 1) * t_size])
-                dma.load(w[pt], W[tile_w, pt * t_size:(pt + 1) * t_size])
+                    idma.load(y[pt], Y[tile_h, pt * t_size:(pt + 1) * t_size])
+                idma.load(w[pt], W[tile_w, pt * t_size:(pt + 1) * t_size])
                 redmule.gemm(x, w[pt], y[pt])
                 if x_id == MESH_X_TILES - 1:
-                    dma.store(Y[tile_h, pt * t_size:(pt + 1) * t_size], y[pt])
+                    idma.store(Y[tile_h, pt * t_size:(pt + 1) * t_size], y[pt])
                 else:
-                    dma.store(y.on(0, 1)[pt], y[pt])
+                    idma.store(y.at_rel(0, 1)[pt], y[pt])
 
         """
         4. Check results

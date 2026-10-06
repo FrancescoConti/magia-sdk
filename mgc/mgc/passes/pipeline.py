@@ -110,7 +110,7 @@ def _subst_attr(a, m):
 def instantiate(op, var, value: Expr):
     """Clone `op` for iteration `var = value`.
 
-    E.g. cloning `dma.load(x[pt], X[pt*8:(pt+1)*8, :])` with `value = step + 1`
+    E.g. cloning `idma.load(x[pt], X[pt*8:(pt+1)*8, :])` with `value = step + 1`
     yields the load for the next iteration: `x[step + 1]`, rows `(step+1)*8 ...`.
     """
     c = op.clone()
@@ -132,7 +132,7 @@ class Item:
     """One schedulable element of a pipeline body (a DMA, a job, or an `if`
     wrapping those), with the buffer slots it reads/writes, the events it
     signals and the `stage` assigned to it."""
-    op: object  # DmaOp | JobOp | IfOp (predicated)
+    op: object  # IdmaOp | JobOp | IfOp (predicated)
     reads: set = field(default_factory=set)
     writes: set = field(default_factory=set)
     events: list = field(default_factory=list)  # (EvtRef, unconditional)
@@ -152,7 +152,7 @@ def _offset(idx: Expr, var: str):
 
 def _accesses(op, var, kdefs):
     """(reads, writes) of buffer slots for a DMA or job."""
-    if isinstance(op, ir.DmaOp):
+    if isinstance(op, ir.IdmaOp):
         key = (alloc_of(op.local).sym.data, _offset(op.slot.data, var))
         return ({key}, set()) if op.dir.data == 1 else (set(), {key})
     roles = _roles(op, kdefs)
@@ -179,7 +179,7 @@ def _roles(job, kdefs):
 def _item(op, var, kdefs) -> Item:
     """Analyse one pipeline-body op into an `Item`; rejects anything that is not
     a transfer, a job or an `if` independent of the iteration variable."""
-    if isinstance(op, (ir.DmaOp, ir.JobOp)):
+    if isinstance(op, (ir.IdmaOp, ir.JobOp)):
         r, w = _accesses(op, var, kdefs)
         ev = [] if op.event is None else [(op.event.data, True)]
         return Item(op, r, w, ev, isinstance(op, ir.JobOp))
@@ -193,7 +193,7 @@ def _item(op, var, kdefs) -> Item:
             for o in reg.block.ops:
                 if isinstance(o, (ir.CommentOp, ir.RemoteOp)):
                     continue
-                if not isinstance(o, (ir.DmaOp, ir.JobOp)):
+                if not isinstance(o, (ir.IdmaOp, ir.JobOp)):
                     raise MgcError(o, 'a predicated pipeline item contains only transfers and jobs')
                 r, w = _accesses(o, var, kdefs)
                 it.reads |= r
@@ -217,7 +217,7 @@ def _item(op, var, kdefs) -> Item:
 class Pipeline(ModulePass):
     """Expands `for i in pipeline(n)` into an explicit software pipeline.
 
-    Example, output-static GEMM body (`dma.load(x[i], ...)`, `redmule.gemm(x[i], w, y)`):
+    Example, output-static GEMM body (`idma.load(x[i], ...)`, `redmule.gemm(x[i], w, y)`):
     the load is stage 0 and the gemm stage 1, so the result is a prologue that
     loads iteration 0, then a loop where step `s` computes iteration `s` while
     loading iteration `s + 1`, with waits placed after the issues. See the
@@ -357,7 +357,7 @@ class Pipeline(ModulePass):
         for op in p.parent_block().ops:
             if op is p:
                 break
-            if isinstance(op, ir.DmaOp):
+            if isinstance(op, ir.IdmaOp):
                 pending.append(op.event.data)
             elif isinstance(op, ir.WaitOp):
                 pending = [e for e in pending if e.key() != op.event.data.key()]
@@ -388,8 +388,8 @@ class Pipeline(ModulePass):
         for v in j.bufs:
             name = alloc_of(v).sym.data
             for key, e in list(own.items()) + list(outer.items()):
-                if e.kind == 'dma' and e.name == name and e.dir == 0:
-                    out.append(wait(ir.EvtRef('dma', name, 0)))
+                if e.kind == 'idma' and e.name == name and e.dir == 0:
+                    out.append(wait(ir.EvtRef('idma', name, 0)))
                     own.pop(key, None)
                     outer.pop(key, None)
                     break
@@ -458,7 +458,7 @@ class Pipeline(ModulePass):
         need = {alloc_of(v).sym.data for it in items if it.is_job and isinstance(it.op, ir.JobOp)
                 for v in it.op.bufs}
         for e in self.outer_pending(p):
-            if e.kind == 'dma' and e.name in need:
+            if e.kind == 'idma' and e.name in need:
                 out.append(wait(ir.EvtRef(e.kind, e.name, e.dir)))
         if p.sync is not None:
             out.append(self.sync(p))
