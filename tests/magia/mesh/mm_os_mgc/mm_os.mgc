@@ -62,6 +62,7 @@ def main():
         2b. Weight data-tile multi-buffer (double buffered over the timeslots).
         """
         w = L1.multi_buffer(W[0:t_size, tile_w], depth=2)
+        redmule_evt = redmule.events(2)
 
         """
         TEST LOOP - REPEAT THE TEST N_ITERATION TIMES.
@@ -79,11 +80,14 @@ def main():
                 a - Load the weight and input data-tile for the next timeslot (if there is one)
                 b - Multiply and add
                 Synchronization is not required.
-                We parallelize the IDMA with Redmule.
+                We parallelize the IDMA with Redmule: the job is programmed while its operands
+                are loaded, committed once they have landed, and waited one step later.
                 """
-                ex = idma.load(x[i], X[tile_h, i * t_size:(i + 1) * t_size])
-                ew = idma.load(w[i], W[i * t_size:(i + 1) * t_size, tile_w])
-                redmule.gemm(x[i], w[i], y)
+                idma.load(x[i], X[tile_h, i * t_size:(i + 1) * t_size])
+                idma.load(w[i], W[i * t_size:(i + 1) * t_size, tile_w])
+                redmule.enqueue(x[i], w[i], y, event=redmule_evt[i])
+                redmule.commit_start()
+                redmule_evt[i].wait()
 
             """
             5. Store the output data-tile back to L2

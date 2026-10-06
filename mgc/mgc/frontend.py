@@ -283,6 +283,7 @@ class Frontend:
         }
         self.module_ops = []
         self.blocks: List[Block] = []
+        self.in_pipeline = False
 
     # -- building ------------------------------------------------------------
     def add(self, op, node=None):
@@ -794,7 +795,13 @@ class Frontend:
             ev = self.action(obj, s) if isinstance(obj, ast.Call) else self.ev(obj)
             if not isinstance(ev, ir.EvtRef):
                 raise MgcError(c, '.wait() applies to events of DMA transfers and accelerator jobs')
-            self.add(ir.WaitOp.create(attributes={'event': ir.EvtAttr(ev)}), s)
+            attrs = {'event': ir.EvtAttr(ev)}
+            lag = self._lag(c)
+            if lag is not None:
+                if ev.kind == 'idma':
+                    raise MgcError(c, '`lag=` applies to accelerator jobs: DMA waits are placed by pipeline()')
+                attrs['lag'] = IntAttr(lag)
+            self.add(ir.WaitOp.create(attributes=attrs), s)
             return None
         if on == 'dma':
             raise MgcError(c, '`dma` was renamed `idma`: use `idma.load` / `idma.store`')
@@ -903,21 +910,46 @@ class Frontend:
             raise MgcError(c, f'unknown arguments: {", ".join(kw)}')
         return ev or ir.EvtRef('hwpe', acc)
 
+    def _lag(self, c):
+        """The `lag=k` argument of a protocol step (`redmule.commit_start(lag=1)`,
+        `ev[i].wait(lag=0)`), or None; only valid inside `pipeline()`."""
+        kw = {k.arg: k.value for k in c.keywords}
+        if set(kw) - {'lag'} or c.args:
+            raise MgcError(c, f'{ast.unparse(c.func)}() takes only `lag=`')
+        if 'lag' not in kw:
+            return None
+        if not self.in_pipeline:
+            raise MgcError(c, '`lag=` is only meaningful inside pipeline()')
+        try:
+            lag = ast.literal_eval(kw['lag'])
+        except ValueError:
+            lag = None
+        if not isinstance(lag, int) or lag < 0:
+            raise MgcError(c, '`lag=` must be a non-negative integer constant')
+        return lag
+
     def hwpe(self, c, acc, fn, s):
         """Accelerator calls on `acc` (e.g. `redmule`):
 
         - `redmule.gemm(x, w, y)` (a job named in `devices.HWPES`): one-shot job,
           computes `y += x @ w`; returns its event;
         - `redmule.enqueue(x, w, y, event=ev[k])`: program a job without starting it;
-        - `redmule.commit()` / `.start()` / `.commit_start()`: explicit queue control.
+        - `redmule.commit()` / `.start()` / `.commit_start()`: explicit queue control
+          (inside `pipeline()`, with an optional `lag=k`).
         """
         dev = devices.HWPES[acc]
         if fn in ('commit', 'start', 'commit_start'):
             job = next(iter(dev.jobs))
-            self.add(ir.HwpeOp.create(attributes={'acc': StringAttr(acc), 'job': StringAttr(job),
-                                                  'action': StringAttr(fn), 'slots': ArrayAttr([])}), s)
+            attrs = {'acc': StringAttr(acc), 'job': StringAttr(job), 'action': StringAttr(fn),
+                     'slots': ArrayAttr([])}
+            lag = self._lag(c)
+            if lag is not None:
+                attrs['lag'] = IntAttr(lag)
+            self.add(ir.HwpeOp.create(attributes=attrs), s)
             return None
         if fn == 'enqueue':
+            if any(k.arg == 'lag' for k in c.keywords):
+                raise MgcError(c, '`lag=` is not accepted on enqueue: pipeline() issues it with its commit')
             job = next(iter(dev.jobs))
             ev = self._event_kw(c, acc)
             bufs, slots = self._job_operands(c, s)
@@ -1021,7 +1053,11 @@ class Frontend:
             def enter():
                 self.env[var] = Sym(var, None, 'int')
 
-            op = ir.PipelineOp.create(attributes=attrs, regions=[self.region(s.body, enter=enter)])
+            self.in_pipeline = True
+            try:
+                op = ir.PipelineOp.create(attributes=attrs, regions=[self.region(s.body, enter=enter)])
+            finally:
+                self.in_pipeline = False
         self.add(op, s)
         if saved is None:
             self.env.pop(var, None)

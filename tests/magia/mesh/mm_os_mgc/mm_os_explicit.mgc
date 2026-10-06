@@ -3,9 +3,10 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Same test as mm_os.mgc, written with the explicit (low-level) schedule instead
-# of pipeline(): multi-buffer slots, event rotation and the RedMulE enqueue / commit /
-# start / commit_start / wait split are spelled out by hand. It compiles to the
-# exact same C as mm_os.mgc (compare with `mgcc.py mm_os.mgc --print-ir-after=pipeline`).
+# of pipeline(): prologue, multi-buffer slots, event rotation and the placement of
+# the RedMulE enqueue / commit_start / wait steps are spelled out by hand. It
+# compiles to the same C as mm_os.mgc, comments aside (compare with
+# `mgcc.py mm_os.mgc --print-ir-after=pipeline`).
 
 from mgc import *
 
@@ -76,12 +77,12 @@ def main():
             ey = idma.load(y, Y[tile_h, tile_w])
             ex = idma.load(x[0], X[tile_h, 0:t_size])
             ew = idma.load(w[0], W[0:t_size, tile_w])
+            # program the first job while its operands are loaded, start it once they have landed
+            redmule.enqueue(x[0], w[0], y, event=redmule_evt[0])
             ex.wait()
             ew.wait()
             ey.wait()
-            # enqueue the first job and commit it: its inputs are already in L1
-            redmule.enqueue(x[0], w[0], y, event=redmule_evt[0])
-            redmule.commit()
+            redmule.commit_start()
 
             """
             4. Cycle over the timeslots.
@@ -89,18 +90,17 @@ def main():
             a - Load the weight and input data-tile for the next timeslot (if there is one)
             b - Multiply and add
             Synchronization is not required.
-            We parallelize the IDMA with Redmule.
+            We parallelize the IDMA with Redmule: the job is programmed while its operands
+            are loaded, committed once they have landed, and waited one step later.
             """
             for i in range(timeslots):
                 if i < timeslots - 1:
-                    # launch the current job (committed in the previous iteration)
-                    redmule.start()
-                    # prefetch the operands of the next iteration
+                    # prefetch the operands of the next iteration and program its job meanwhile
                     ex = idma.load(x[i + 1], X[tile_h, (i + 1) * t_size:(i + 2) * t_size])
-                    # program the next job while the DMA prefetches its operands
-                    redmule.enqueue(x[i + 1], w[i + 1], y, event=redmule_evt[i + 1])
                     ew = idma.load(w[i + 1], W[(i + 1) * t_size:(i + 2) * t_size, tile_w])
-                    # commit & start the next job once its operands have landed
+                    redmule.enqueue(x[i + 1], w[i + 1], y, event=redmule_evt[i + 1])
+                    # commit & start the next job once its operands have landed: it runs
+                    # behind the current one
                     ex.wait()
                     ew.wait()
                     redmule.commit_start()

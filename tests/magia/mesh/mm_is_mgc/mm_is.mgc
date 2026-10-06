@@ -65,7 +65,9 @@ def main():
                 if x_id == 0:
                     idma.load(y[pt], Y[tile_h, pt * t_size:(pt + 1) * t_size])
                 idma.load(w[pt], W[tile_w, pt * t_size:(pt + 1) * t_size])
-                redmule.gemm(x, w[pt], y[pt])
+                j = redmule.enqueue(x, w[pt], y[pt])
+                redmule.commit_start()
+                j.wait(lag=0)  # the block moves on to the neighbour in the next step
                 if x_id == MESH_X_TILES - 1:
                     idma.store(Y[tile_h, pt * t_size:(pt + 1) * t_size], y[pt])
                 else:

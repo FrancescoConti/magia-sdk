@@ -44,7 +44,7 @@ or the compiler; the unit tests fail if they are out of date.
 
 | Directory | Source | Content |
 |---|---|---|
-| `tests/magia/mesh/mm_os_mgc` | `mm_os.mgc`, `mm_os_explicit.mgc` | output-static GEMM, 2-stage pipeline |
+| `tests/magia/mesh/mm_os_mgc` | `mm_os.mgc`, `mm_os_explicit.mgc` | output-static GEMM, 2-stage pipeline, RedMulE job overlapped with the next loads |
 | `tests/magia/mesh/mm_ws_mgc` | `mm_ws.mgc`, `mm_ws_explicit.mgc` | weight-static systolic GEMM, partial sums move down columns |
 | `tests/magia/mesh/mm_is_mgc` | `mm_is.mgc` | input-static systolic GEMM, partial sums move east along rows |
 | `tests/magia/mesh/mm_os_l1k` | `mm_os_l1k.mgc`, `src/kernels.c` | output-static GEMM with a CV32 kernel in the pipeline |
@@ -74,7 +74,9 @@ for y_id, x_id in tiles():
             if y_id == 0:
                 idma.load(y[pt], Y[pt * t_size:(pt + 1) * t_size, tile_w])
             idma.load(x[pt], X[pt * t_size:(pt + 1) * t_size, tile_h])
-            redmule.gemm(x[pt], w, y[pt])                 # y += x @ w
+            j = redmule.enqueue(x[pt], w, y[pt])          # y += x @ w
+            redmule.commit_start()
+            j.wait(lag=0)                                 # done within the step
             if y_id == MESH_Y_TILES - 1:
                 idma.store(Y[pt * t_size:(pt + 1) * t_size, tile_w], y[pt])
             else:
@@ -172,6 +174,7 @@ waiting on an event that was never issued.
 | `redmule.enqueue(x, w, y, event=ev[k])` | `mg_redmule_gemm_enqueue` |
 | `redmule.commit()`, `start()`, `commit_start()` | `mg_redmule_gemm_commit`, `_start`, `_commit_start` |
 | `ev[k].wait()` | `mg_redmule_wait` |
+| `commit…(lag=k)`, `.wait(lag=k)` | inside `pipeline()` only: place the step `k` stages later (see below) |
 | `k(a, b, ...)` (an `l1_kernel`) | `c_fn(a, b, ..., params)`, a synchronous call on the CV32 core |
 | `sync(GLOBAL)`, `sync(ROW)`, `sync(COL)` | `fsync_sync_global/row/col` + `eu_fsync_wait` |
 | `rotate(v)` | places the multi-buffer slot selection for `v` here (optional) |
@@ -188,31 +191,57 @@ operand addresses, then the parameters, all as `uint32_t`, and must be provided 
 
 ### `pipeline(n, skew=None, steps=None, sync=None)`
 
-The body describes one iteration `i`: transfers and jobs, optionally inside `if` statements that
-do not depend on `i`. The compiler:
+The body describes one iteration `i`: transfers, jobs, CV32 kernel calls and HWPE protocol steps,
+with transfers and jobs optionally inside `if` statements that do not depend on `i`. The compiler:
 
 1. **Assigns stages.** An item is placed one stage after the latest earlier item that writes a
-   slot it reads; otherwise it is in stage 0. Examples: load (0) → gemm (1) → store (2).
-2. **Checks multi-buffer depth.** Each multi-buffer must have at least as many slots as the
-   number of stages its slots are live across.
+   slot it reads; otherwise it is in stage 0. Examples: load (0) → kernel (1) → store (2).
+   HWPE protocol steps follow their own rules (below).
+2. **Checks depths.** Each multi-buffer must have at least as many slots as the number of stages
+   its slots are live across. Each HWPE can hold `queue_depth` jobs (2 for RedMulE), and each job
+   in flight needs its own event.
 3. **Generates the schedule.** A prologue runs stage 0 of iteration 0. In loop step `s`,
-   stage `k` works on iteration `s + 1 - k`, guarded by `0 <= s + 1 - k < n`. Within a step, the
-   issue order is: transfers, then accelerator jobs, then CV32 calls; the waits follow, in issue
-   order.
+   stage `k` works on iteration `s + 1 - k`, guarded by `0 <= s + 1 - k < n`. A step runs in four
+   phases:
+   1. transfers, enqueues and `redmule.gemm` one-shots are issued;
+   2. commits/starts follow, each after the waits of the DMAs it needs, so the HWPE computes
+      while the core is busy with the next phase;
+   3. CV32 kernel calls, each followed by the commits that consume its output;
+   4. the remaining waits, in issue order.
 
 With `skew` and `steps`, the loop runs over `steps` global time steps. The tile is active when
 `0 <= t - skew <= last step`. `sync=SCOPE` adds a barrier after the prologue and at the end of
 every time step, active or not.
 
-RedMulE uses early enqueue (program the next job during the DMA, commit it behind the current
-one) only when all of these hold:
+#### HWPE jobs
 
-- the pipeline has 2 stages and no skew;
-- it contains exactly one job;
-- none of the job's operands is written by another tile.
+A job is written as the steps of the HWPE protocol:
 
-Otherwise each job is issued and waited within its step. Data from a neighbour is only valid
-after the barrier, so the job cannot be committed earlier.
+```python
+ev = redmule.events(2)
+for i in pipeline(timeslots):
+    idma.load(x[i], X[...])
+    idma.load(w[i], W[...])
+    redmule.enqueue(x[i], w[i], y, event=ev[i])   # program the job: addresses only
+    redmule.commit_start()                         # or commit() and start()
+    ev[i].wait()
+```
+
+| Step | Stage |
+|---|---|
+| `commit_start()` / `commit()` | the stage of its latest producer, placed after it in the step (after the DMA's wait, or after the CV32 call); one stage later if the producer is an asynchronous job, or if the operand is written by another tile (data from a neighbour is valid only after the barrier) |
+| `enqueue(...)` | same stage as its commit, issued together with the transfers so that programming overlaps the DMA |
+| `start()` | commit + `lag` |
+| `.wait()` | start (or `commit_start`) + `lag`, **default `lag=1`**: job `i` runs while iteration `i + 1` loads; the wait is the writer of the job's outputs for later items |
+
+`lag=k` on `commit`/`commit_start`/`start`/`.wait()` moves the step `k` stages later. In the
+example, the step of iteration `i + 1` loads, enqueues and commits job `i + 1` behind job `i`,
+then waits for job `i`. `.wait(lag=0)` keeps the job inside its step, as the systolic WS/IS
+tests do. With load → job → store, the store follows the wait one stage later, so `y` needs
+depth 3. The compiler checks that each protocol is complete and in order. It also checks that
+there is at most one explicit job per accelerator per `pipeline()` body and that the job does
+not exceed the queue or the event array. `event=` may be omitted when only one job is in flight.
+`redmule.gemm(...)` remains available as a one-shot job, issued and waited within its step.
 
 The control-flow shape of the generated C follows the hand-written tests, because GCC's output
 depends on it:
@@ -320,7 +349,7 @@ IR conventions:
 | Pass | Job |
 |---|---|
 | `legalize-idma` | views → N-dimensional transfers, checked against `devices.IDMA`; base and per-transfer L2 addresses |
-| `pipeline` | `mg.pipeline` → explicit guarded schedule: stages, depth check, job protocol |
+| `pipeline` | `mg.pipeline` → explicit guarded schedule: stages, HWPE protocol placement, depth/queue checks |
 | `job-lower` | `mg.job` → RedMulE one-shot or CV32 call; parameters and shape checks from the descriptors |
 | `multi-buffer` | slot indices → static addresses or rotating pointers with an `if`/`switch` selection |
 | `l1-layout` | identical L1 layout on all tiles; uses `*_max` tile sizes when buffers are accessed remotely; neighbour L1 bases |
@@ -342,22 +371,29 @@ Extending:
 
 2×2 mesh, gvsoc. Exit cycle of each tile, sorted. Every test reports 0 errors.
 
+> The `mm_os_mgc`, `mm_ws_mgc` (`mm_ws.mgc`), `mm_is_mgc` and `mm_os_l1k` rows are measured with
+> the explicit HWPE protocol in `pipeline()` (2026-10-06). On the same gvsoc build, the code
+> generated by the earlier early-enqueue template gives 355888 / 355903 / 391194 / 391209 (OS),
+> 247466 / 247500 / 528967 / 594869 (WS), 245423 / 245431 / 583806 / 583814 (IS) and
+> 466622 / 466635 / 506299 / 506303 (L1 kernel). The WS/IS rows are therefore not comparable with
+> the reference rows, which were measured on an earlier setup and have not been re-run.
+
 | Test | Cycles |
 |---|---|
 | `mm_os_mglib` (reference) | 355929 / 355970 / 391240 / 391241 |
-| `mm_os_mgc` | 355950 / 355956 / 391247 / 391255 |
+| `mm_os_mgc` | 355517 / 355529 / 390745 / 390757 |
 | `mm_ws_2` (raw HAL) | 42954 / 43002 / 153104 / 177774 |
 | `mm_ws_mglib` (reference) | 45735 / 45769 / 156153 / 180870 |
-| `mm_ws_mgc` (`mm_ws.mgc`) | 45585 / 45603 / 152663 / 177604 |
+| `mm_ws_mgc` (`mm_ws.mgc`) | 247499 / 247526 / 528999 / 594873 |
 | `mm_ws_mgc` (`mm_ws_explicit.mgc`) | 45398 / 45432 / 152476 / 177424 |
 | `mm_is_2` (raw HAL) | 43292 / 43297 / 171430 / 171435 |
 | `mm_is_mglib` (reference) | 46064 / 46064 / 174466 / 174466 |
-| `mm_is_mgc` | 44645 / 44668 / 172983 / 173007 |
-| `mm_os_l1k` | 466772 / 466787 / 506252 / 506261 |
+| `mm_is_mgc` | 245316 / 245317 / 583684 / 583685 |
+| `mm_os_l1k` | 466796 / 466827 / 506287 / 506297 |
 
 - **OS:** `mm_os_mglib` clips `tile_w` against `N_SIZE` instead of `K_SIZE`; mgc uses `K_SIZE`.
   With that line changed back, `main` disassembles identically and the cycles are equal.
-  `mm_os.mgc` and `mm_os_explicit.mgc` produce the same C.
+  `mm_os.mgc` and `mm_os_explicit.mgc` produce the same C, comments aside.
 - **WS/IS:** the mglib references are about 3k cycles slower than the raw-HAL tests (mglib
   event bookkeeping). The mgc versions are 0.8–1.9% faster than the references on the slowest
   tile. The differences:
@@ -367,18 +403,20 @@ Extending:
   - L1 offsets use `*_max` tile sizes. `mm_ws_2` and `mm_is_2` use the local tile size, which
     gives wrong neighbour addresses when edge tiles are clipped.
 - **L1 kernel:** issuing RedMulE before the CV32 call takes 29k cycles (5.7%) less than calling
-  the kernel first.
+  the kernel first. With the explicit protocol, job `i - 1` runs on RedMulE during the CV32
+  call of iteration `i`, and job `i` is committed right after it.
 
 ## Limitations
 
 - One `tiles()` loop and one `pipeline()` per test; `cores()` left for future implementation to enable support for PULP cluster parallelism.
-- HWPE (RedMulE) early enqueue is used only in 2-stage pipelines.
+- One explicit HWPE job (enqueue / commit / wait) per accelerator per `pipeline()` body; HWPE
+  protocol steps cannot be inside `if`. DMA waits inside `pipeline()` are always placed by the
+  compiler.
 - fp16 only; RedMulE GEMM is the only HWPE accelerator described.
 - L1 kernels run only on the CV32 control core.
 - Comments inside a `pipeline()` body are dropped, except the leading docstring.
 - No L1 capacity check (tile sizes are run-time values).
 - The event check accepts code that is valid on at least one path, so it can miss errors that
   depend on correlated conditions.
-- The generated tests do not support `STALLING=1`.
 - Multicasts are lowered to unicast transfers. On a 1-wide row/column nothing is transferred, so
   waiting on the multicast's event is invalid there.

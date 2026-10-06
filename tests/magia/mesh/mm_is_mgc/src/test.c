@@ -278,17 +278,18 @@ int main(void)
                 }
 
                 if (pt < timeslots) {
-                    mg_redmule_gemm(&redmule_ctrl,
-                                    &eu_ctrl,
-                                    WAIT_MODE,
-                                    l1_addr_x,
-                                    w_pt,
-                                    y_pt,
-                                    (uint16_t)tile_h,
-                                    (uint16_t)tile_w,
-                                    (uint16_t)t_size,
-                                    &redmule_evt,
-                                    NULL);
+                    mg_redmule_gemm_enqueue(&redmule_ctrl,
+                                            &eu_ctrl,
+                                            WAIT_MODE,
+                                            l1_addr_x,
+                                            w_pt,
+                                            y_pt,
+                                            (uint16_t)tile_h,
+                                            (uint16_t)tile_w,
+                                            (uint16_t)t_size,
+                                            &redmule_evt,
+                                            NULL);
+                    mg_redmule_gemm_commit_start(&redmule_ctrl);
                 }
 
                 if (pt < (timeslots - 1)) {

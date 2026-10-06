@@ -38,13 +38,16 @@ def main():
         x_raw = L1.multi_buffer(X[tile_h, 0:t_size], depth=2)
         x = L1.multi_buffer(X[tile_h, 0:t_size], depth=2)
         w = L1.multi_buffer(W[0:t_size, tile_w], depth=3)
+        redmule_evt = redmule.events(2)
 
         idma.load(y, Y[tile_h, tile_w]).wait()
         for i in pipeline(timeslots):
             idma.load(x_raw[i], X[tile_h, i * t_size:(i + 1) * t_size])
             idma.load(w[i], W[i * t_size:(i + 1) * t_size, tile_w])
             copy(x[i], x_raw[i])
-            redmule.gemm(x[i], w[i], y)
+            redmule.enqueue(x[i], w[i], y, event=redmule_evt[i])
+            redmule.commit_start()
+            redmule_evt[i].wait()
         idma.store(Y[tile_h, tile_w], y).wait()
 
         check(Y[tile_h, tile_w], Z[tile_h, tile_w], tol=0x11)

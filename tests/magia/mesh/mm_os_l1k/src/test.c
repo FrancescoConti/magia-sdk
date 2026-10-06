@@ -114,13 +114,12 @@ int main(void)
     volatile uint32_t x_raw_pt;
     volatile uint32_t x_pt;
     volatile uint32_t w_pt;
-    volatile uint32_t x_pt_prev;
-    volatile uint32_t w_pt_prev;
     volatile uint32_t x_raw_pt_next;
     volatile uint32_t w_pt_next;
 
     mg_event_t idma_evt_y, idma_evt_x_raw, idma_evt_w;
-    mg_event_t redmule_evt;
+    mg_event_t redmule_evt_0, redmule_evt_1;
+    mg_event_t *redmule_evt_prev, *redmule_evt_curr;
 
     mg_idma_memcpy_2d(&idma_ctrl,
                       &eu_ctrl,
@@ -163,31 +162,30 @@ int main(void)
 
     for (int i = 0; i < timeslots + 1; i++) {
         if (i % 2) {
-            x_raw_pt      = l1_addr_x_raw_1;
-            x_raw_pt_next = l1_addr_x_raw_0;
-            x_pt          = l1_addr_x_1;
-            x_pt_prev     = l1_addr_x_0;
+            x_raw_pt         = l1_addr_x_raw_1;
+            x_raw_pt_next    = l1_addr_x_raw_0;
+            x_pt             = l1_addr_x_1;
+            redmule_evt_curr = &redmule_evt_1;
+            redmule_evt_prev = &redmule_evt_0;
         } else {
-            x_raw_pt      = l1_addr_x_raw_0;
-            x_raw_pt_next = l1_addr_x_raw_1;
-            x_pt          = l1_addr_x_0;
-            x_pt_prev     = l1_addr_x_1;
+            x_raw_pt         = l1_addr_x_raw_0;
+            x_raw_pt_next    = l1_addr_x_raw_1;
+            x_pt             = l1_addr_x_0;
+            redmule_evt_curr = &redmule_evt_0;
+            redmule_evt_prev = &redmule_evt_1;
         }
 
         switch (i % 3) {
         case 0:
             w_pt      = l1_addr_w_0;
-            w_pt_prev = l1_addr_w_2;
             w_pt_next = l1_addr_w_1;
             break;
         case 1:
             w_pt      = l1_addr_w_1;
-            w_pt_prev = l1_addr_w_0;
             w_pt_next = l1_addr_w_2;
             break;
         case 2:
             w_pt      = l1_addr_w_2;
-            w_pt_prev = l1_addr_w_1;
             w_pt_next = l1_addr_w_0;
             break;
         }
@@ -218,22 +216,21 @@ int main(void)
                               NULL);
         }
 
-        if (i > 0) {
-            mg_redmule_gemm(&redmule_ctrl,
-                            &eu_ctrl,
-                            WAIT_MODE,
-                            x_pt_prev,
-                            w_pt_prev,
-                            l1_addr_y,
-                            (uint16_t)tile_h,
-                            (uint16_t)t_size,
-                            (uint16_t)tile_w,
-                            &redmule_evt,
-                            NULL);
-        }
-
         if (i < timeslots) {
+            mg_redmule_gemm_enqueue(&redmule_ctrl,
+                                    &eu_ctrl,
+                                    WAIT_MODE,
+                                    x_pt,
+                                    w_pt,
+                                    l1_addr_y,
+                                    (uint16_t)tile_h,
+                                    (uint16_t)t_size,
+                                    (uint16_t)tile_w,
+                                    redmule_evt_curr,
+                                    NULL);
+
             l1_copy_fp16(x_pt, x_raw_pt, tile_h * t_size);
+            mg_redmule_gemm_commit_start(&redmule_ctrl);
         }
 
         if (i < (timeslots - 1)) {
@@ -242,7 +239,7 @@ int main(void)
         }
 
         if (i > 0) {
-            mg_redmule_wait(&eu_ctrl, WAIT_MODE, &redmule_evt);
+            mg_redmule_wait(&eu_ctrl, WAIT_MODE, redmule_evt_prev);
         }
     }
 

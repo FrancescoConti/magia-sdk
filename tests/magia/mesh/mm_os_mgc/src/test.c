@@ -183,11 +183,7 @@ int main(void)
                           reps_w,
                           &idma_evt_w,
                           NULL);
-        mg_idma_wait(&eu_ctrl, 0, WAIT_MODE, &idma_evt_x);
-        mg_idma_wait(&eu_ctrl, 0, WAIT_MODE, &idma_evt_w);
-        mg_idma_wait(&eu_ctrl, 0, WAIT_MODE, &idma_evt_y);
 
-        // enqueue the first job and commit it: its inputs are already in L1
         mg_redmule_gemm_enqueue(&redmule_ctrl,
                                 &eu_ctrl,
                                 WAIT_MODE,
@@ -199,7 +195,10 @@ int main(void)
                                 (uint16_t)tile_w,
                                 &redmule_evt_0,
                                 NULL);
-        mg_redmule_gemm_commit(&redmule_ctrl);
+        mg_idma_wait(&eu_ctrl, 0, WAIT_MODE, &idma_evt_x);
+        mg_idma_wait(&eu_ctrl, 0, WAIT_MODE, &idma_evt_w);
+        mg_idma_wait(&eu_ctrl, 0, WAIT_MODE, &idma_evt_y);
+        mg_redmule_gemm_commit_start(&redmule_ctrl);
 
         /**
          * 4. Cycle over the timeslots.
@@ -207,7 +206,8 @@ int main(void)
          * a - Load the weight and input data-tile for the next timeslot (if there is one)
          * b - Multiply and add
          * Synchronization is not required.
-         * We parallelize the IDMA with Redmule.
+         * We parallelize the IDMA with Redmule: the job is programmed while its operands
+         * are loaded, committed once they have landed, and waited one step later.
          */
         for (int i = 0; i < timeslots; i++) {
             if (i % 2) {
@@ -227,10 +227,6 @@ int main(void)
             }
 
             if (i < (timeslots - 1)) {
-                // launch the current job (committed in the previous iteration)
-                mg_redmule_gemm_start(&redmule_ctrl);
-
-                // prefetch the operands of the next iteration
                 mg_idma_memcpy_2d(&idma_ctrl,
                                   &eu_ctrl,
                                   WAIT_MODE,
@@ -242,19 +238,6 @@ int main(void)
                                   reps_x,
                                   &idma_evt_x,
                                   NULL);
-
-                // program the next job while the DMA prefetches its operands
-                mg_redmule_gemm_enqueue(&redmule_ctrl,
-                                        &eu_ctrl,
-                                        WAIT_MODE,
-                                        x_pt_next,
-                                        w_pt_next,
-                                        l1_addr_y,
-                                        (uint16_t)tile_h,
-                                        (uint16_t)t_size,
-                                        (uint16_t)tile_w,
-                                        redmule_evt_next,
-                                        NULL);
 
                 mg_idma_memcpy_2d(&idma_ctrl,
                                   &eu_ctrl,
@@ -268,15 +251,22 @@ int main(void)
                                   &idma_evt_w,
                                   NULL);
 
-                // commit & start the next job once its operands have landed
+                mg_redmule_gemm_enqueue(&redmule_ctrl,
+                                        &eu_ctrl,
+                                        WAIT_MODE,
+                                        x_pt_next,
+                                        w_pt_next,
+                                        l1_addr_y,
+                                        (uint16_t)tile_h,
+                                        (uint16_t)t_size,
+                                        (uint16_t)tile_w,
+                                        redmule_evt_next,
+                                        NULL);
                 mg_idma_wait(&eu_ctrl, 0, WAIT_MODE, &idma_evt_x);
                 mg_idma_wait(&eu_ctrl, 0, WAIT_MODE, &idma_evt_w);
                 mg_redmule_gemm_commit_start(&redmule_ctrl);
-
-                // wait for the current job
                 mg_redmule_wait(&eu_ctrl, WAIT_MODE, redmule_evt_curr);
             } else {
-                // last iteration: nothing to prefetch
                 mg_redmule_wait(&eu_ctrl, WAIT_MODE, redmule_evt_curr);
             }
         }

@@ -16,7 +16,8 @@ Check (dataflow over the region tree, states none/pending/maybe):
 * waiting on storage that was certainly never issued is an error.
 `maybe` (only on some paths, e.g. under correlated `if`s) is accepted, so
 the check never rejects a correct program; loops are analysed twice, with
-event-array slots rotated across the back edge.
+event-array slots rotated across the back edge (a wait on `ev[v - 1]`, issued
+by the previous iteration, is checked in the second walk).
 """
 
 from __future__ import annotations
@@ -59,6 +60,7 @@ class _Analysis:
         self.overlap = set()
         self.loops = []  # loop variables, innermost last
         self.cont = []  # states at `continue`, per loop
+        self.first = set()  # loops in their first walk: slots `v - k` may come from the previous iteration
 
     def key(self, e: ir.EvtRef, op):
         """Canonical identity of the storage `e` names (array slots are
@@ -102,7 +104,7 @@ class _Analysis:
                 self.issue(op, st, op.event.data)
             elif isinstance(op, ir.WaitOp):
                 k = self.key(op.event.data, op)
-                if st.get(k, N) == N:
+                if st.get(k, N) == N and not (k[0] == 'arr' and k[2] in self.first):
                     raise MgcError(op, f'wait on an event that was never issued (`{op.event.data.name}`)')
                 st[k] = N
             elif isinstance(op, ir.IfOp):
@@ -123,7 +125,9 @@ class _Analysis:
                         entry[k] = v
                 self.loops.append(var)
                 self.cont.append([])
+                self.first.add(var)
                 s1 = self.run(op.body.block.ops, dict(entry))
+                self.first.discard(var)
                 for c in self.cont[-1]:
                     s1 = _merge(s1, c)
                 self.cont[-1] = []

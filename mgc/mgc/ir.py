@@ -404,6 +404,7 @@ class HwpeOp(IRDLOperation):
     event = opt_attr_def(EvtAttr)
     params = opt_attr_def(ArrayAttr)
     addrs = opt_attr_def(ArrayAttr)
+    lag = opt_attr_def(IntAttr)  # pipeline(): extra stages after the earliest legal one
 
 
 @irdl_op_definition
@@ -422,6 +423,7 @@ class WaitOp(IRDLOperation):
     """Block until the DMA transfer / accelerator job tied to `event` is done."""
     name = 'mg.wait'
     event = attr_def(EvtAttr)
+    lag = opt_attr_def(IntAttr)  # pipeline(): stages after the job's start (default 1)
 
 
 @irdl_op_definition
