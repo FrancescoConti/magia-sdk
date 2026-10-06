@@ -64,7 +64,7 @@ for y_id, x_id in tiles():
     t_start: u8 = y_id * 2
     total_timeslots: u8 = (MESH_Y_TILES - 1) * 2 + timeslots + 1
 
-    w = L1.alloc(W[tile_h, tile_w])
+    w = L1.single_buffer(W[tile_h, tile_w])
     x = L1.multi_buffer(X[0:t_size, tile_h], depth=2)
     y = L1.multi_buffer(Y[0:t_size, tile_w], depth=3)
 
@@ -132,7 +132,7 @@ tile split, or an integer expression (which removes the dimension).
 
 | Expression | Meaning |
 |---|---|
-| `b = L1.alloc(view)` | dense L1 buffer with the view's shape; the view also fixes the transfer geometry |
+| `b = L1.single_buffer(view)` | dense L1 buffer with the view's shape; the view also fixes the transfer geometry |
 | `b = L1.multi_buffer(view, depth=N)` | `N` L1 buffers (*slots*, `N` ≥ 2 and constant), each shaped like `view`, used for double/triple buffering: e.g. load the next tile into one slot while an accelerator reads the current one. `b` itself is not an operand; it must be indexed to pick a slot. `b[c]` with a constant `c` (e.g. `b[0]`) is always the same, fixed slot. `b[v + k]`, where `v` is a loop variable and `k` a constant offset with \|k\| < N, is a *rotating* slot: the slot used changes with `v` (it is slot `(v + k) % N`), so `b[i]` and `b[i + 1]` mean "current" and "next" in iteration `i`. |
 | `b.on(dy, dx)[k]` | The copy of buffer `b` that lives in the L1 of a **neighbour tile**, i.e. the tile at `(y_id + dy, x_id + dx)`; `dy` and `dx` must be constants (e.g. `b.on(0, 1)` is the tile to the right, `b.on(1, 0)` the one below). Every tile allocates `b` at the same L1 offset, so the neighbour's copy is found at the neighbour's L1 base plus the local offset. `[k]` picks a slot as for a local multi-buffer (omit it if `b` has a single slot). It can only be used as the destination of `dma.store`, to push a local buffer to a neighbour: `dma.store(b.on(0, 1)[k], b[k])` copies local slot `k` of `b` into the same slot of `b` on the tile to the right. Source and destination must be the same buffer and the same slot. |
 
@@ -253,9 +253,9 @@ def main():
     for y_id, x_id in tiles():
         tile_h = y_id.split(M)                    # rows owned by this tile
         tile_w = x_id.split(K)                    # columns owned by this tile
-        x = L1.alloc(X[tile_h, :])
-        w = L1.alloc(W[:, tile_w])
-        y = L1.alloc(Y[tile_h, tile_w])
+        x = L1.single_buffer(X[tile_h, :])
+        w = L1.single_buffer(W[:, tile_w])
+        y = L1.single_buffer(Y[tile_h, tile_w])
         dma.load(x, X[tile_h, :])
         dma.load(w, W[:, tile_w])
         dma.load(y, Y[tile_h, tile_w]).wait()

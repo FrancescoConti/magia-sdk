@@ -45,7 +45,7 @@ def main():
         """
         2. Static weight data-tile.
         """
-        w = L1.alloc(W[tile_h, tile_w])
+        w = L1.single_buffer(W[tile_h, tile_w])
 
         """
         2a. Input data-tile multi-buffer.

@@ -37,7 +37,7 @@ class _Ns:
         return _stub
 
 
-L1 = _Ns()  # L1.alloc(view), L1.multi_buffer(view, depth=N)
+L1 = _Ns()  # L1.single_buffer(view), L1.multi_buffer(view, depth=N)
 dma = _Ns()  # dma.load(dst, src), dma.store(dst, src)
 redmule = _Ns()  # gemm / enqueue / commit / start / commit_start / events
 

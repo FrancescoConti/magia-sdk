@@ -85,7 +85,7 @@ def base_addr(view: ir.View, t) -> BinOp:
 class LegalizeDma(ModulePass):
     """Gives every `mg.alloc` and `mg.dma` its transfer geometry and L2 address.
 
-    Example: `x = L1.alloc(X[0:8, 0:16])` gets a 2-D `xfer` and base address
+    Example: `x = L1.single_buffer(X[0:8, 0:16])` gets a 2-D `xfer` and base address
     `l2_addr_x`; a later `dma.load(x, X[8:16, 0:16])` is checked to have the same
     geometry and gets address `l2_addr_x + (8 * N * 2)`. A load with a different
     geometry or shape than the buffer's declaration is an `MgcError`.

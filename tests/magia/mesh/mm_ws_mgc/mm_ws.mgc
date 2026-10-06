@@ -45,7 +45,7 @@ def main():
         """
         2. L1 buffers: the static weights, and multi-buffers for the input and output blocks.
         """
-        w = L1.alloc(W[tile_h, tile_w])
+        w = L1.single_buffer(W[tile_h, tile_w])
         x = L1.multi_buffer(X[0:t_size, tile_h], depth=2)
         y = L1.multi_buffer(Y[0:t_size, tile_w], depth=3)
 

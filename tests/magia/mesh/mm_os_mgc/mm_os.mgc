@@ -51,7 +51,7 @@ def main():
         """
         2. Static output data-tile, resident in L1 for the whole test.
         """
-        y = L1.alloc(Y[tile_h, tile_w])
+        y = L1.single_buffer(Y[tile_h, tile_w])
 
         """
         2a. Input data-tile multi-buffer (double buffered over the timeslots).

@@ -34,7 +34,7 @@ def main():
         timeslots: u8 = N_TIMESLOTS
         t_size: u8 = N // timeslots
 
-        y = L1.alloc(Y[tile_h, tile_w])
+        y = L1.single_buffer(Y[tile_h, tile_w])
         x_raw = L1.multi_buffer(X[tile_h, 0:t_size], depth=2)
         x = L1.multi_buffer(X[tile_h, 0:t_size], depth=2)
         w = L1.multi_buffer(W[0:t_size, tile_w], depth=3)

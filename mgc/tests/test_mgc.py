@@ -172,7 +172,7 @@ class Extensibility(unittest.TestCase):
 
     def _x3(self, alloc):
         s = _read(OS, 'mm_os_explicit.mgc').replace('Z = l2(', self.X3[0], 1).replace(
-            self.X3[1], self.X3[1] + '\n        q = L1.alloc(' + alloc + ')\n        dma.load(q, ' + alloc + ').wait()', 1)
+            self.X3[1], self.X3[1] + '\n        q = L1.single_buffer(' + alloc + ')\n        dma.load(q, ' + alloc + ').wait()', 1)
         return _c(OS, 'x.mgc', s)
 
     def test_rank_limit_from_capabilities(self):

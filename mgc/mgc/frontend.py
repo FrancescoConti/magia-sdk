@@ -20,7 +20,7 @@ Input (abridged `.mgc`)::
     @test("demo")
     def main():
         for y_id, x_id in tiles():
-            x = L1.alloc(X[0:8, 0:8])
+            x = L1.single_buffer(X[0:8, 0:8])
             dma.load(x, X[0:8, 0:8]).wait()
 
 Output: an xDSL `ModuleOp` holding one `mg.tensor` per `l2()`, one `mg.define`
@@ -138,7 +138,7 @@ class Split:
 
 @dataclass(eq=False)
 class Buf:
-    """An L1 buffer from `L1.alloc(view)` (depth 1) or `L1.multi_buffer(view, depth=N)`.
+    """An L1 buffer from `L1.single_buffer(view)` (depth 1) or `L1.multi_buffer(view, depth=N)`.
 
     `value` is the SSA value of the `mg.alloc` op, `view` the L2 view that fixed
     its shape and `depth` the number of slots.
@@ -688,7 +688,7 @@ class Frontend:
         """Plain `name = <call or expr>` inside the tile loop. The right side picks the meaning:
 
         - `y_id.split(E)` -> tile split (`mg.split`);
-        - `L1.alloc(view)` / `L1.multi_buffer(view, depth=N)` -> L1 buffer (`alloc()`);
+        - `L1.single_buffer(view)` / `L1.multi_buffer(view, depth=N)` -> L1 buffer (`alloc()`);
         - `redmule.events(n)` -> event array (`mg.events`);
         - `dma.load/store(...)`, `redmule.gemm(...)`, `kernel(...)` -> the name is
           bound to the returned event, so `e.wait()` works later;
@@ -708,7 +708,7 @@ class Frontend:
             self.env[name] = sp
             self.add(ir.SplitOp.create(attributes={'sym': StringAttr(name), 'axis': StringAttr(ax.axis),
                                                    'extent': ir.E(sp.extent)}), s)
-        elif (on, fn) in (('L1', 'alloc'), ('L1', 'multi_buffer')):
+        elif (on, fn) in (('L1', 'single_buffer'), ('L1', 'multi_buffer')):
             self.alloc(s, name, fn)
         elif fn == 'events' and on in devices.HWPES:
             n = const_of(self.expr(s.value.args[0])) if s.value.args else None
@@ -726,11 +726,11 @@ class Frontend:
             self.scalar(s, tgt, s.value, None)
 
     def alloc(self, s, name, kind):
-        """`b = L1.alloc(X[r, c])` or `b = L1.multi_buffer(X[r, c], depth=3)`.
+        """`b = L1.single_buffer(X[r, c])` or `b = L1.multi_buffer(X[r, c], depth=3)`.
 
         The view argument only provides the buffer's shape (and transfer
         geometry); no data moves. Emits `mg.alloc` and binds `name` to a `Buf`
-        with `depth` slots (1 for `alloc`, >= 2 for `multi_buffer`).
+        with `depth` slots (1 for `single_buffer`, >= 2 for `multi_buffer`).
         """
         args = s.value.args
         view = self.ev(args[0]) if args else None
