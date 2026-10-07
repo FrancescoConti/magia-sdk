@@ -381,6 +381,49 @@ def main():
         with self.assertRaisesRegex(MgcError, 'L1->L1'):
             _c(OS, 'x.mgc', src)
 
+    GATHER = '''from mgc import *
+
+M, N, K = sizes("M_SIZE", "N_SIZE", "K_SIZE")
+
+@test("test_gather")
+def main():
+    for y_id, x_id in tiles():
+        tile_h = y_id.split(M)
+        r = L1.single_buffer((tile_h,), fp16)
+        rs = L1.single_buffer((MESH_X_TILES, tile_h), fp16)
+        if x_id != 0:
+            idma.store(rs.at(y_id, 0)[x_id, :], r).wait()
+        sync(ROW)
+'''
+
+    def test_store_into_block_of_another_buffer(self):
+        c = _c(OS, 'x.mgc', self.GATHER)
+        self.assertIn('get_l1_base(GET_ID(y_id, 0)) + (l1_addr_rs + (x_id * tile_h * 2) - l1_tile_base),', c)
+        self.assertIn('mg_idma_memcpy_1d(', c)
+        self.assertIn('&idma_evt_r,', c)
+        self.assertIn('l1_addr_rs = l1_addr_r + (tile_h_max * 2);', c)  # uniform layout
+
+    def test_store_into_strided_block(self):
+        src = (self.GATHER.replace('(tile_h,), fp16', '(tile_h, 4), fp16')
+               .replace('(MESH_X_TILES, tile_h), fp16', '(tile_h, 16), fp16')
+               .replace('[x_id, :]', '[:, 4:8]'))
+        c = _c(OS, 'x.mgc', src)
+        self.assertIn('(l1_addr_rs + (8) - l1_tile_base),', c)
+        # 8 bytes per row, L1 stride 32 bytes, tile_h rows
+        self.assertIn('l1_addr_r,\n                          8,\n                          32,\n'
+                      '                          tile_h,', c)
+
+    def test_store_into_block_multicast(self):
+        c = _c(OS, 'x.mgc', self.GATHER.replace('rs.at(y_id, 0)[x_id, :]', 'rs.col[x_id, :]'))
+        self.assertIn('get_l1_base(GET_ID(mcast_r, x_id)) + (l1_addr_rs + (x_id * tile_h * 2) - l1_tile_base),', c)
+
+    def test_store_into_block_checks(self):
+        with self.assertRaisesRegex(MgcError, 'shape mismatch'):
+            _c(OS, 'x.mgc', self.GATHER.replace('[x_id, :]', '[x_id, 0:4]'))
+        with self.assertRaisesRegex(MgcError, 'single-slot buffer'):
+            _c(OS, 'x.mgc', self.GATHER.replace('rs = L1.single_buffer((MESH_X_TILES, tile_h), fp16)',
+                                                'rs = L1.multi_buffer((MESH_X_TILES, tile_h), fp16, depth=2)'))
+
     def test_old_names_rejected(self):
         with self.assertRaisesRegex(MgcError, 'renamed `buf.at_rel'):
             self.ws('idma.store(y.on(1, 0)[pt], y[pt])')

@@ -25,6 +25,7 @@ from .. import devices
 from .. import ir
 from ..errors import MgcError
 from ..expr import BinOp, Const, Paren, Raw, Sym, const_of, equal, is_zero, product, sub
+from ..frontend import Tensor
 from .common import alloc_of, esize, tensors
 
 
@@ -109,10 +110,31 @@ class LegalizeIdma(ModulePass):
 
     def idma(self, op, ts):
         """Check and annotate one `mg.idma`: neighbour stores are dense copies of
-        the whole buffer; L2 transfers must match the buffer's declared shape and
+        the whole buffer, or of the buffer into a block of another one (`axi` is
+        then the byte offset of the block, computed with this tile's sizes); L2 transfers must match the buffer's declared shape and
         geometry, and get the L2 address as base plus per-dimension offset."""
         a = alloc_of(op.local)
         decl = a.view.data
+        if op.remote is not None and op.remote.owner.view is not None:
+            # L1 -> a block of another buffer on other tile(s): the block is laid out
+            # in the destination buffer like a view of an L2 tensor of the buffer's shape
+            d = alloc_of(op.remote)
+            view = op.remote.owner.view.data
+            shp, bshp = view.shape, decl.shape
+            if len(shp) != len(bshp) or not all(equal(x, y) for x, y in zip(shp, bshp)):
+                raise MgcError(op, f'shape mismatch: the `{d.sym.data}` block is {shp}, '
+                               f'`{a.sym.data}` is {bshp}')
+            if d.dtype.data != a.dtype.data:
+                raise MgcError(op, f'`{a.sym.data}` and `{d.sym.data}` have different dtypes')
+            t = Tensor(d.sym.data, None, d.view.data.shape, d.dtype.data)
+            off = None
+            for k, s in enumerate(view.starts):
+                if not is_zero(s):
+                    o = product(s, t.stride(k), Const(t.esize))
+                    off = o if off is None else BinOp('+', off, o)
+            op.attributes['xfer'] = ir.XferAttr(geometry(op, view, t))
+            op.attributes['axi'] = ir.E(off if off is not None else Const(0))
+            return
         if op.remote is not None:
             # L1 -> same slot on a neighbour tile: both sides dense
             op.attributes['xfer'] = ir.XferAttr(ir.Xfer(product(*decl.shape, Const(esize(a, ts)))))

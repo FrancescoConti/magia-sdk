@@ -272,8 +272,16 @@ class Emitter:
                 base, fn = None, devices.IDMA.multicast[mode.upper()]
             else:
                 raise MgcError(op, f'internal: {mode} multicast was not lowered')
-            axi = op.addr.data if base is None else f'{base} + ({op.addr.data} - l1_tile_base)'
-            geo = [x.len.c()]
+            if r.view is None:
+                dst = op.addr.data
+                geo = [x.len.c()]
+            else:
+                # a block of another buffer: its address plus the block's byte offset
+                dst = f'l1_addr_{alloc_of(op.remote).sym.data}'
+                if not is_zero(op.axi.data):
+                    dst += f' + ({op.axi.data.c()})'
+                geo = [x.len.c()] + [e.c() for reps, std in x.outer for e in (std, reps)]
+            axi = dst if base is None else f'{base} + ({dst} - l1_tile_base)'
         else:
             axi = op.axi.data.c()
             geo = [f'len_{n}']

@@ -56,9 +56,10 @@ class IdmaMcast(ModulePass):
                 continue
             var = Sym(f'mcast_{alloc_of(op.local).sym.data}', None, 'uint32_t')
             ty, tx, me = (y, var, x) if mode == 'row' else (var, x, y)
-            rop = ir.RemoteOp.create(operands=[op.local],
-                                     attributes={'mode': StringAttr('abs'), 'ty': ir.E(ty), 'tx': ir.E(tx)},
-                                     result_types=[ir.BufType()])
+            rattrs = {'mode': StringAttr('abs'), 'ty': ir.E(ty), 'tx': ir.E(tx)}
+            if r.view is not None:
+                rattrs['view'] = r.view
+            rop = ir.RemoteOp.create(operands=[r.buf], attributes=rattrs, result_types=[ir.BufType()])
             uni = ir.IdmaOp.create(operands=[op.local, rop.res], attributes=dict(op.attributes))
             guard = ir.IfOp.create(attributes={'cond': ir.E(Cmp('!=', var, me))},
                                    regions=[new_block_region([rop, uni]), new_block_region([])])

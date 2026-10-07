@@ -302,13 +302,15 @@ class AllocOp(IRDLOperation):
 
 @irdl_op_definition
 class RemoteOp(IRDLOperation):
-    """The same allocation on other tile(s), by `mode`:
+    """An allocation on other tile(s), by `mode`:
     `rel`: the tile at (y_id + dy, x_id + dx), constant offsets;
     `abs`: the tile at (ty, tx), any integer expressions;
-    `row` / `col`: every other tile of this tile's row / column (multicast)."""
+    `row` / `col`: every other tile of this tile's row / column (multicast).
+    With `view`, only that block of the (single-slot) allocation."""
     name = 'mg.remote'
     buf = operand_def(BufType)
     mode = attr_def(StringAttr)  # 'rel' | 'abs' | 'row' | 'col'
+    view = opt_attr_def(ViewAttr)  # tensorless view over the buffer's shape
     dy = opt_attr_def(ExprAttr)  # rel
     dx = opt_attr_def(ExprAttr)  # rel
     ty = opt_attr_def(ExprAttr)  # abs
@@ -367,8 +369,9 @@ class PipelineOp(_Region):
 
 @irdl_op_definition
 class IdmaOp(IRDLOperation):
-    """iDMA transfer between a local L1 slot and either an L2 view or the same
-    slot on other tile(s) (`remote`, see `mg.remote`). dir 0: into L1, 1: out of L1."""
+    """iDMA transfer between a local L1 slot and either an L2 view, the same
+    slot on other tile(s) or a block of another buffer there (`remote`, see
+    `mg.remote`). dir 0: into L1, 1: out of L1."""
     name = 'mg.idma'
     local = operand_def(BufType)
     remote = opt_operand_def(BufType)

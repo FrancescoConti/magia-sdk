@@ -175,6 +175,17 @@ class Slot:
 
 
 @dataclass(eq=False)
+class RemoteView:
+    """A block of a single-slot buffer on other tile(s), `buf.at(y, x)[r, :]`.
+
+    `view` selects elements of the buffer (tensorless `ir.View` over its shape),
+    e.g. `[r, 0:+tile_h]` (first dimension dropped) for `rowms.at(y_id, 0)[r, :]`.
+    """
+    remote: Remote
+    view: ir.View
+
+
+@dataclass(eq=False)
 class EvArray:
     """An array of `depth` accelerator events from `ev = redmule.events(n)`.
 
@@ -531,6 +542,8 @@ class Frontend:
             idx = n.slice.elts if isinstance(n.slice, ast.Tuple) else [n.slice]
             if isinstance(v, Tensor):
                 return self.view(n, v, idx)
+            if isinstance(v, Remote) and (len(idx) > 1 or isinstance(idx[0], ast.Slice)):
+                return self.remote_view(n, v, idx)
             if isinstance(v, (Buf, Remote, EvArray)):
                 if len(idx) != 1:
                     raise MgcError(n, 'multi-buffers and event arrays take a single index')
@@ -603,6 +616,22 @@ class Frontend:
                 else:
                     raise MgcError(i, 'index must be an integer, a slice or a tile split')
         return ir.View(t.pyname, starts, sizes, kept)
+
+    def remote_view(self, n, r: Remote, idx) -> RemoteView:
+        """`b.at(y, x)[i, j, ...]`: a block of single-slot buffer `b` on other tile(s).
+
+        Indices follow `view()` (a slice, or an integer that drops the dimension),
+        over the buffer's shape. For `rowms` of shape (MESH_X_TILES, tile_h),
+        `rowms.at(y_id, 0)[x_id, :]` is row `x_id`: starts `[x_id, 0]`, sizes
+        `[1, tile_h]`, view shape `[tile_h]`. A single slice index (`b.at(...)[0:4]`)
+        also makes a view; a single integer is a slot (`b.at(...)[k]`).
+        """
+        b = r.buf
+        if b.depth != 1:
+            raise MgcError(n, f'a block of `{b.name}` on another tile needs a single-slot buffer')
+        t = Tensor(b.name, None, b.view.shape, b.value.owner.dtype.data)
+        v = self.view(n, t, idx)
+        return RemoteView(r, ir.View(None, v.starts, v.sizes, v.kept))
 
     # -- statements ----------------------------------------------------------
     def flush_comments(self, s):
@@ -852,7 +881,9 @@ class Frontend:
           on the tile below (neighbour store);
         - `idma.store(y.at(r, c)[0], y[0])`: same, on tile `(r, c)` (absolute ids);
         - `idma.store(y.row[0], y[0])` / `y.col[0]`: same, on every other tile of
-          this tile's row / column (multicast).
+          this tile's row / column (multicast);
+        - `idma.store(rowms.at(y_id, 0)[x_id, :], rowm)`: L1 -> row `x_id` of another
+          (single-slot) buffer on tile `(y_id, 0)`; works with every remote target.
 
         Emits `mg.idma` and returns the DMA event of that buffer/direction, to
         be waited with `.wait()`. Geometry is checked later by `legalize-idma`.
@@ -876,19 +907,25 @@ class Frontend:
             d = 1
             if isinstance(tv, ir.View):
                 attrs['l2'] = ir.ViewAttr(tv)
-            elif isinstance(tv, Slot) and isinstance(tv.buf, Remote) or isinstance(tv, Remote):
-                r = tv.buf if isinstance(tv, Slot) else tv
-                ridx = tv.index if isinstance(tv, Slot) else Const(0)
-                if r.buf is not buf:
-                    raise MgcError(c, 'a remote store copies a buffer into the same buffer on another tile')
-                if ridx.c() != idx.c():
-                    raise MgcError(c, 'a remote store must target the same slot it reads')
-                rattrs = {'mode': StringAttr(r.mode)}
+            elif isinstance(tv, (Remote, RemoteView)) or isinstance(tv, Slot) and isinstance(tv.buf, Remote):
+                if isinstance(tv, RemoteView):
+                    # L1 -> a block of another (single-slot) buffer on other tile(s)
+                    r = tv.remote
+                    rattrs = {'mode': StringAttr(r.mode), 'view': ir.ViewAttr(tv.view)}
+                else:
+                    r = tv.buf if isinstance(tv, Slot) else tv
+                    ridx = tv.index if isinstance(tv, Slot) else Const(0)
+                    if r.buf is not buf:
+                        raise MgcError(c, 'a remote store copies a buffer into the same buffer on another '
+                                       'tile, or into a block of another one (`b.at(y, x)[i, :]`)')
+                    if ridx.c() != idx.c():
+                        raise MgcError(c, 'a remote store must target the same slot it reads')
+                    rattrs = {'mode': StringAttr(r.mode)}
                 if r.mode == 'rel':
                     rattrs.update({'dy': ir.E(r.a), 'dx': ir.E(r.b)})
                 elif r.mode == 'abs':
                     rattrs.update({'ty': ir.E(r.a), 'tx': ir.E(r.b)})
-                rop = self.add(ir.RemoteOp.create(operands=[buf.value], attributes=rattrs,
+                rop = self.add(ir.RemoteOp.create(operands=[r.buf.value], attributes=rattrs,
                                                   result_types=[ir.BufType()]), s)
                 operands.append(rop.res)
             else:
