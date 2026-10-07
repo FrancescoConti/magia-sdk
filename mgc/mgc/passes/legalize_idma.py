@@ -25,7 +25,7 @@ from .. import devices
 from .. import ir
 from ..errors import MgcError
 from ..expr import BinOp, Const, Paren, Raw, Sym, const_of, equal, is_zero, product, sub
-from .common import alloc_of, tensors
+from .common import alloc_of, esize, tensors
 
 
 def geometry(node, view: ir.View, t, caps=None) -> ir.Xfer:
@@ -97,6 +97,10 @@ class LegalizeIdma(ModulePass):
         for op in module.walk():
             if isinstance(op, ir.AllocOp):
                 v = op.view.data
+                if v.tensor is None:
+                    # L1-only buffer: dense, no L2 address
+                    op.attributes['xfer'] = ir.XferAttr(ir.Xfer(product(*v.shape, Const(esize(op, ts)))))
+                    continue
                 t = ts[v.tensor]
                 op.attributes['xfer'] = ir.XferAttr(geometry(op, v, t))
                 op.attributes['axi'] = ir.E(base_addr(v, t))
@@ -111,8 +115,7 @@ class LegalizeIdma(ModulePass):
         decl = a.view.data
         if op.remote is not None:
             # L1 -> same slot on a neighbour tile: both sides dense
-            t = ts[decl.tensor]
-            op.attributes['xfer'] = ir.XferAttr(ir.Xfer(product(*decl.shape, Const(t.esize))))
+            op.attributes['xfer'] = ir.XferAttr(ir.Xfer(product(*decl.shape, Const(esize(a, ts)))))
             return
         view = op.l2.data
         t = ts[view.tensor]

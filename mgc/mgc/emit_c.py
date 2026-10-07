@@ -244,7 +244,8 @@ class Emitter:
         for k, a in enumerate(op.addrs.data):
             slot = f'l1_addr_{n}' if depth == 1 else f'l1_addr_{n}_{k}'
             w.line(f'uint32_t {slot} = {a.data.c()};')
-        w.line(f'uint32_t l2_addr_{n} = {op.axi.data.c()};')
+        if op.axi is not None:
+            w.line(f'uint32_t l2_addr_{n} = {op.axi.data.c()};')
 
     def idma(self, op):
         """Print an iDMA call, e.g.

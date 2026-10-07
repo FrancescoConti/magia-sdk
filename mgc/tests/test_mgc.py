@@ -425,6 +425,44 @@ class TopFunction(unittest.TestCase):
             _c(OS, 'mm_os.mgc', self.top('').replace('\n\ndef my_gemm', '\ndef my_gemm'))
 
 
+class L1Only(unittest.TestCase):
+    """`L1.single_buffer((d0, d1), dtype)`: buffers shaped directly, with no L2 tensor behind them."""
+
+    SRC = '''from mgc import *
+
+M, N, K = sizes("M_SIZE", "N_SIZE", "K_SIZE")
+X = l2("x_inp", (M, N), fp16)
+W = l2("w_inp", (N, K), fp16)
+
+@test("test_l1_only")
+def main():
+    for y_id, x_id in tiles():
+        tile_h = y_id.split(M)
+        tile_w = x_id.split(K)
+        x = L1.single_buffer(X[tile_h, :])
+        w = L1.single_buffer(W[:, tile_w])
+        t = L1.single_buffer((tile_h, tile_w), fp16)
+        s = L1.multi_buffer((tile_h, 16), fp16, depth=2)
+        idma.load(x, X[tile_h, :]).wait()
+        idma.load(w, W[:, tile_w]).wait()
+        redmule.gemm(x, w, t)
+'''
+
+    def test_alloc_without_tensor(self):
+        c = _c(OS, 'x.mgc', self.SRC)
+        self.assertIn('uint32_t len_t = tile_h * tile_w * 2;', c)
+        self.assertIn('uint32_t l1_addr_t = l1_addr_w + (N_SIZE * tile_w * 2);', c)
+        self.assertIn('uint32_t l1_addr_s_1 = l1_addr_s_0 + (tile_h * 16 * 2);', c)
+        self.assertNotIn('l2_addr_t', c)
+        self.assertNotIn('l2_addr_s', c)
+
+    def test_dtype_required(self):
+        with self.assertRaisesRegex(MgcError, 'needs a dtype'):
+            _c(OS, 'x.mgc', self.SRC.replace('((tile_h, tile_w), fp16)', '((tile_h, tile_w))'))
+        with self.assertRaisesRegex(MgcError, 'needs a dtype'):
+            _c(OS, 'x.mgc', self.SRC.replace('((tile_h, tile_w), fp16)', '((tile_h, tile_w), fp64)'))
+
+
 if __name__ == '__main__':
     unittest.main()
 

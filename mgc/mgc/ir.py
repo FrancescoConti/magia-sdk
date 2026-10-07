@@ -42,8 +42,9 @@ from .expr import Expr
 
 @dataclass(eq=False)
 class View:
-    """A view of an L2 tensor: per-dimension start/size; `kept` is False for an integer index."""
-    tensor: str  # mg.tensor symbol
+    """A view of an L2 tensor: per-dimension start/size; `kept` is False for an integer index.
+    `tensor` is None for the shape of an L1-only buffer (`L1.single_buffer((d0, d1), fp16)`)."""
+    tensor: Optional[str]  # mg.tensor symbol, None = L1-only
     starts: List[Expr]
     sizes: List[Expr]
     kept: List[bool]
@@ -56,7 +57,7 @@ class View:
         parts = []
         for st, sz, k in zip(self.starts, self.sizes, self.kept):
             parts.append(f'{st.c()}:+{sz.c()}' if k else st.c())
-        return f'{self.tensor}[{", ".join(parts)}]'
+        return f'{self.tensor or "L1"}[{", ".join(parts)}]'
 
 
 @dataclass(eq=False)
@@ -286,10 +287,12 @@ class ScalarOp(IRDLOperation):
 @irdl_op_definition
 class AllocOp(IRDLOperation):
     """L1 buffer with `depth` slots, shaped like `view` (which also fixes its
-    transfer geometry). legalize-idma adds `xfer`, l1-layout adds `addrs`."""
+    transfer geometry; an L1-only buffer has a tensorless view and no L2 address).
+    legalize-idma adds `xfer` (and `axi`), l1-layout adds `addrs`."""
     name = 'mg.alloc'
     sym = attr_def(StringAttr)
     view = attr_def(ViewAttr)
+    dtype = attr_def(StringAttr)
     depth = attr_def(IntAttr)
     xfer = opt_attr_def(XferAttr)
     axi = opt_attr_def(ExprAttr)

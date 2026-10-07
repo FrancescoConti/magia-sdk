@@ -141,7 +141,8 @@ class Buf:
     """An L1 buffer from `L1.single_buffer(view)` (depth 1) or `L1.multi_buffer(view, depth=N)`.
 
     `value` is the SSA value of the `mg.alloc` op, `view` the L2 view that fixed
-    its shape and `depth` the number of slots.
+    its shape (tensorless for `L1.single_buffer((d0, d1), dtype)`) and `depth`
+    the number of slots.
     """
     name: str
     value: object  # SSA value of the mg.alloc
@@ -700,7 +701,7 @@ class Frontend:
         """Plain `name = <call or expr>` inside the tile loop. The right side picks the meaning:
 
         - `y_id.split(E)` -> tile split (`mg.split`);
-        - `L1.single_buffer(view)` / `L1.multi_buffer(view, depth=N)` -> L1 buffer (`alloc()`);
+        - `L1.single_buffer(view | (d0, ...), dtype)` / `L1.multi_buffer(..., depth=N)` -> L1 buffer (`alloc()`);
         - `redmule.events(n)` -> event array (`mg.events`);
         - `idma.load/store(...)`, `redmule.gemm(...)`, `kernel(...)` -> the name is
           bound to the returned event, so `e.wait()` works later;
@@ -741,13 +742,27 @@ class Frontend:
         """`b = L1.single_buffer(X[r, c])` or `b = L1.multi_buffer(X[r, c], depth=3)`.
 
         The view argument only provides the buffer's shape (and transfer
-        geometry); no data moves. Emits `mg.alloc` and binds `name` to a `Buf`
-        with `depth` slots (1 for `single_buffer`, >= 2 for `multi_buffer`).
+        geometry); no data moves. Alternatively, `L1.single_buffer((d0, d1), fp16)`
+        gives the shape directly (each `d` a tile split or an integer expression)
+        for an L1-only buffer with no L2 tensor behind it. Emits `mg.alloc` and
+        binds `name` to a `Buf` with `depth` slots (1 for `single_buffer`, >= 2
+        for `multi_buffer`).
         """
         args = s.value.args
-        view = self.ev(args[0]) if args else None
-        if not isinstance(view, ir.View):
-            raise MgcError(s, f'L1.{kind}() takes an L2 tensor view that fixes its shape')
+        if args and isinstance(args[0], ast.Tuple):
+            if len(args) != 2 or _name(args[1]) not in DTYPES:
+                raise MgcError(s, f'L1.{kind}((d0, d1, ...), dtype) needs a dtype: {", ".join(DTYPES)}')
+            sizes = []
+            for e in args[0].elts:
+                v = self.ev(e)
+                sizes.append(v.size if isinstance(v, Split) else self.expr(e))
+            view = ir.View(None, [Const(0)] * len(sizes), sizes, [True] * len(sizes))
+            dtype = _name(args[1])
+        else:
+            view = self.ev(args[0]) if args else None
+            if not isinstance(view, ir.View):
+                raise MgcError(s, f'L1.{kind}() takes an L2 tensor view or a shape tuple and a dtype')
+            dtype = self.env[view.tensor].dtype
         depth = 1
         for kw in s.value.keywords:
             if kw.arg == 'depth' and kind == 'multi_buffer':
@@ -759,7 +774,7 @@ class Frontend:
         if not view.shape:
             raise MgcError(s, 'cannot allocate a scalar')
         op = self.add(ir.AllocOp.create(attributes={'sym': StringAttr(name), 'view': ir.ViewAttr(view),
-                                                    'depth': IntAttr(depth)},
+                                                    'dtype': StringAttr(dtype), 'depth': IntAttr(depth)},
                                         result_types=[ir.BufType()]), s)
         op.res.name_hint = name
         self.env[name] = Buf(name, op.res, view, depth)
