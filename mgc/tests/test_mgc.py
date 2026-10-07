@@ -424,6 +424,25 @@ def main():
             _c(OS, 'x.mgc', self.GATHER.replace('rs = L1.single_buffer((MESH_X_TILES, tile_h), fp16)',
                                                 'rs = L1.multi_buffer((MESH_X_TILES, tile_h), fp16, depth=2)'))
 
+    def test_store_from_block_of_local_buffer(self):
+        src = self.GATHER.replace('idma.store(rs.at(y_id, 0)[x_id, :], r)', 'idma.store(rs.at(y_id, 0)[x_id, :], rs[1, :])')
+        c = _c(OS, 'x.mgc', src)
+        self.assertIn('get_l1_base(GET_ID(y_id, 0)) + (l1_addr_rs + (x_id * tile_h * 2) - l1_tile_base),\n'
+                      '                          l1_addr_rs + (tile_h * 2),', c)
+        self.assertIn('&idma_evt_rs,', c)
+        c = _c(OS, 'x.mgc', src.replace('rs[1, :]', 'rs[0, :]'))
+        self.assertIn('l1_addr_rs,\n', c)
+
+    def test_store_from_block_checks(self):
+        with self.assertRaisesRegex(MgcError, 'must be contiguous'):
+            _c(OS, 'x.mgc', self.GATHER.replace('rs.at(y_id, 0)[x_id, :], r)', 'rs.at(y_id, 0)[:, 0], rs[:, 1])'))
+        with self.assertRaisesRegex(MgcError, 'shape mismatch'):
+            _c(OS, 'x.mgc', self.GATHER.replace(', r)', ', rs[1, 0:4])'))
+        with self.assertRaisesRegex(MgcError, 'stored into a block'):
+            _c(OS, 'x.mgc', self.GATHER.replace('rs.at(y_id, 0)[x_id, :], r)', 'rs.at(y_id, 0), rs[1, :])'))
+        with self.assertRaisesRegex(MgcError, 'only be the source'):
+            _c(OS, 'x.mgc', self.GATHER.replace('idma.store(rs.at(y_id, 0)[x_id, :], r)', 'idma.load(rs[1, :], r)'))
+
     def test_old_names_rejected(self):
         with self.assertRaisesRegex(MgcError, 'renamed `buf.at_rel'):
             self.ws('idma.store(y.on(1, 0)[pt], y[pt])')

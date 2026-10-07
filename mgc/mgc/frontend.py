@@ -186,6 +186,17 @@ class RemoteView:
 
 
 @dataclass(eq=False)
+class LocalView:
+    """A block of a local single-slot buffer, `buf[r, :]`.
+
+    `view` selects elements of the buffer as in `RemoteView`, e.g. `[0, 0:+tile_h]`
+    for `rowms[0, :]`. Only the source of a store into a block of another buffer.
+    """
+    buf: object  # Buf
+    view: ir.View
+
+
+@dataclass(eq=False)
 class EvArray:
     """An array of `depth` accelerator events from `ev = redmule.events(n)`.
 
@@ -544,6 +555,8 @@ class Frontend:
                 return self.view(n, v, idx)
             if isinstance(v, Remote) and (len(idx) > 1 or isinstance(idx[0], ast.Slice)):
                 return self.remote_view(n, v, idx)
+            if isinstance(v, Buf) and (len(idx) > 1 or isinstance(idx[0], ast.Slice)):
+                return LocalView(v, self.block_view(n, v, idx))
             if isinstance(v, (Buf, Remote, EvArray)):
                 if len(idx) != 1:
                     raise MgcError(n, 'multi-buffers and event arrays take a single index')
@@ -626,12 +639,16 @@ class Frontend:
         `[1, tile_h]`, view shape `[tile_h]`. A single slice index (`b.at(...)[0:4]`)
         also makes a view; a single integer is a slot (`b.at(...)[k]`).
         """
-        b = r.buf
+        return RemoteView(r, self.block_view(n, r.buf, idx, ' on another tile'))
+
+    def block_view(self, n, b, idx, where='') -> ir.View:
+        """The tensorless `ir.View` selecting `b[idx...]` over the shape of
+        single-slot buffer `b` (indices as in `view()`)."""
         if b.depth != 1:
-            raise MgcError(n, f'a block of `{b.name}` on another tile needs a single-slot buffer')
+            raise MgcError(n, f'a block of `{b.name}`{where} needs a single-slot buffer')
         t = Tensor(b.name, None, b.view.shape, b.value.owner.dtype.data)
         v = self.view(n, t, idx)
-        return RemoteView(r, ir.View(None, v.starts, v.sizes, v.kept))
+        return ir.View(None, v.starts, v.sizes, v.kept)
 
     # -- statements ----------------------------------------------------------
     def flush_comments(self, s):
@@ -821,6 +838,9 @@ class Frontend:
         if isinstance(v, (Remote, Slot)):
             raise MgcError(n, 'buffers on other tiles (`.at_rel()`, `.at()`, `.row`, `.col`) can only be '
                            'the destination of idma.store')
+        if isinstance(v, LocalView):
+            raise MgcError(n, 'a block of a local buffer (`b[i, :]`) can only be the source of a store into '
+                           'a block of another buffer (`idma.store(c.at(y, x)[j, :], b[i, :])`)')
         raise MgcError(n, 'expected an L1 buffer or multi-buffer slot')
 
     def action(self, c, s):
@@ -884,6 +904,8 @@ class Frontend:
           this tile's row / column (multicast);
         - `idma.store(rowms.at(y_id, 0)[x_id, :], rowm)`: L1 -> row `x_id` of another
           (single-slot) buffer on tile `(y_id, 0)`; works with every remote target.
+        - `idma.store(rowms.at(y_id, 0)[x_id, :], rowms[0, :])`: same, reading a
+          contiguous block of a local (single-slot) buffer.
 
         Emits `mg.idma` and returns the DMA event of that buffer/direction, to
         be waited with `.wait()`. Geometry is checked later by `legalize-idma`.
@@ -902,9 +924,17 @@ class Frontend:
             attrs['l2'] = ir.ViewAttr(view)
             d = 0
         else:
-            buf, idx = self.operand(src)
+            sv = self.ev(src) if isinstance(src, ast.Subscript) else None
+            if isinstance(sv, LocalView):
+                buf, idx = sv.buf, Const(0)
+                attrs['src'] = ir.ViewAttr(sv.view)
+            else:
+                buf, idx = self.operand(src)
             tv = self.ev(dst)
             d = 1
+            if 'src' in attrs and not isinstance(tv, RemoteView):
+                raise MgcError(c, 'a block of a local buffer (`b[i, :]`) can only be stored into a block of '
+                               'another buffer (`c.at(y, x)[j, :]`)')
             if isinstance(tv, ir.View):
                 attrs['l2'] = ir.ViewAttr(tv)
             elif isinstance(tv, (Remote, RemoteView)) or isinstance(tv, Slot) and isinstance(tv.buf, Remote):

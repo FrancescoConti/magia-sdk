@@ -82,6 +82,17 @@ def base_addr(view: ir.View, t) -> BinOp:
     return e
 
 
+def block_offset(view: ir.View, t):
+    """Byte offset of the first element of `view` in a dense buffer shaped like
+    `t`: `(x_id * tile_h * 2)` for row `x_id` of a (MESH_X_TILES, tile_h) fp16 buffer."""
+    off = None
+    for k, s in enumerate(view.starts):
+        if not is_zero(s):
+            o = product(s, t.stride(k), Const(t.esize))
+            off = o if off is None else BinOp('+', off, o)
+    return off if off is not None else Const(0)
+
+
 @dataclass(frozen=True)
 class LegalizeIdma(ModulePass):
     """Gives every `mg.alloc` and `mg.idma` its transfer geometry and L2 address.
@@ -110,8 +121,9 @@ class LegalizeIdma(ModulePass):
 
     def idma(self, op, ts):
         """Check and annotate one `mg.idma`: neighbour stores are dense copies of
-        the whole buffer, or of the buffer into a block of another one (`axi` is
-        then the byte offset of the block, computed with this tile's sizes); L2 transfers must match the buffer's declared shape and
+        the whole buffer, or of the buffer (or of a contiguous block of it, at byte
+        offset `obi`) into a block of another one (`axi` is then the byte offset of
+        the block, computed with this tile's sizes); L2 transfers must match the buffer's declared shape and
         geometry, and get the L2 address as base plus per-dimension offset."""
         a = alloc_of(op.local)
         decl = a.view.data
@@ -120,20 +132,22 @@ class LegalizeIdma(ModulePass):
             # in the destination buffer like a view of an L2 tensor of the buffer's shape
             d = alloc_of(op.remote)
             view = op.remote.owner.view.data
-            shp, bshp = view.shape, decl.shape
+            src = op.src.data if op.src is not None else None
+            shp, bshp = view.shape, (src or decl).shape
+            sname = f'`{a.sym.data}` block' if src else f'`{a.sym.data}`'
             if len(shp) != len(bshp) or not all(equal(x, y) for x, y in zip(shp, bshp)):
-                raise MgcError(op, f'shape mismatch: the `{d.sym.data}` block is {shp}, '
-                               f'`{a.sym.data}` is {bshp}')
+                raise MgcError(op, f'shape mismatch: the `{d.sym.data}` block is {shp}, {sname} is {bshp}')
             if d.dtype.data != a.dtype.data:
                 raise MgcError(op, f'`{a.sym.data}` and `{d.sym.data}` have different dtypes')
             t = Tensor(d.sym.data, None, d.view.data.shape, d.dtype.data)
-            off = None
-            for k, s in enumerate(view.starts):
-                if not is_zero(s):
-                    o = product(s, t.stride(k), Const(t.esize))
-                    off = o if off is None else BinOp('+', off, o)
             op.attributes['xfer'] = ir.XferAttr(geometry(op, view, t))
-            op.attributes['axi'] = ir.E(off if off is not None else Const(0))
+            op.attributes['axi'] = ir.E(block_offset(view, t))
+            if src is not None:
+                # the L1 side is dense: the local block must be contiguous
+                ts = Tensor(a.sym.data, None, decl.shape, a.dtype.data)
+                if geometry(op, src, ts).rank != 1:
+                    raise MgcError(op, f'the `{a.sym.data}` block must be contiguous')
+                op.attributes['obi'] = ir.E(block_offset(src, ts))
             return
         if op.remote is not None:
             # L1 -> same slot on a neighbour tile: both sides dense

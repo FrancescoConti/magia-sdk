@@ -371,16 +371,19 @@ class PipelineOp(_Region):
 class IdmaOp(IRDLOperation):
     """iDMA transfer between a local L1 slot and either an L2 view, the same
     slot on other tile(s) or a block of another buffer there (`remote`, see
-    `mg.remote`). dir 0: into L1, 1: out of L1."""
+    `mg.remote`). dir 0: into L1, 1: out of L1. A store into a block may read a
+    contiguous block of the local buffer (`src`)."""
     name = 'mg.idma'
     local = operand_def(BufType)
     remote = opt_operand_def(BufType)
     dir = attr_def(IntAttr)
     slot = attr_def(ExprAttr)
     l2 = opt_attr_def(ViewAttr)
+    src = opt_attr_def(ViewAttr)  # store from a block of the local buffer (`b[i, :]`)
     event = attr_def(EvtAttr)
     xfer = opt_attr_def(XferAttr)  # legalize-idma
     axi = opt_attr_def(ExprAttr)  # legalize-idma: L2-side address
+    obi = opt_attr_def(ExprAttr)  # legalize-idma: byte offset of the `src` block in the local buffer
     addr = opt_attr_def(StringAttr)  # multi-buffer: local slot address
 
 

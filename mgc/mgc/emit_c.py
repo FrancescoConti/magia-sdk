@@ -288,7 +288,11 @@ class Emitter:
             for d in range(len(x.outer)):
                 sfx = '' if d == 0 else str(d + 1)
                 geo += [f'std{sfx}_{n}', f'reps{sfx}_{n}']
-        args = ['&idma_ctrl', '&eu_ctrl', WAIT_MODE, str(op.dir.data), axi, op.addr.data] + geo
+        obi = op.addr.data
+        if op.obi is not None and not is_zero(op.obi.data):
+            # a block of the local buffer
+            obi += f' + ({op.obi.data.c()})'
+        args = ['&idma_ctrl', '&eu_ctrl', WAIT_MODE, str(op.dir.data), axi, obi] + geo
         args += [op.event.data.cname, 'NULL']
         self.w.blank()
         self.w.call(fn, args)
