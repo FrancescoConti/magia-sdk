@@ -1,0 +1,210 @@
+# Copyright 2026 ETH Zurich, University of Bologna and Fondazione Chips-IT.
+# Licensed under the Apache License, Version 2.0, see LICENSE for details.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Flat-Attention test
+# Compile with
+#   mgc/.venv/bin/python mgc/mgcc.py tests/magia/mesh/mgc_flat_attn_naive/mgc_flat_attn_naive.mgc \
+#       -o tests/magia/mesh/mgc_flat_attn_naive/src/test.c
+
+from mgc import *
+
+S, D, P, H = sizes("SEQ_LENGTH", "EMBED_SIZE", "PROJ_SIZE", "NUM_HEADS")  # from include/test.h
+q_   = l2("q_inp",  (S, P),    fp16)
+kt_  = l2("k_inp",  (P, S),    fp16)
+v_   = l2("v_inp",  (S, P),    fp16)
+o_   = l2("o_out",  (S, P),    fp16)
+o_gold = l2("o_gold", (S, P),  fp16)  # golden
+
+WAIT_MODE = define(WFE)
+S_BLOCK_SIZE_Q  = define(64)
+S_BLOCK_SIZE_KV = define(64)
+
+# Implemented in src/kernels.c, synchronous on the tile's CV32 core.
+# memset_zero: y[:] = 0 on the CV32 core (32-bit stores).
+memset_zero = l1_kernel("l1_memset_zero_fp16", operands=("y:out",), params=("y.size",), executor=CORE)
+# copy: y[:] = x[:] on the CV32 core (32-bit loads/stores).
+copy = l1_kernel("l1_copy_fp16", operands=("y:out", "x:in"), params=("x.size",), executor=CORE)
+# spatz_scale_rsqrt_p: y[:] = x[:] * 1/sqrt(PROJ_SIZE) on Spatz (vfmul.vf, scalar broadcast).
+spatz_scale_rsqrt_p = l1_kernel("l1_scale_rsqrt_p_fp16_spatz", operands=("y:out", "x:in"), params=("x.size",), executor=CORE)
+# spatz_rowmax: m[r] = max_c x[r, c] on Spatz (reducemax kernel, reduce over the last axis).
+spatz_rowmax = l1_kernel("l1_rowmax_fp16_spatz", operands=("m:out", "x:in"), params=("x.shape[0]", "x.shape[1]"), executor=CORE)
+# spatz_max: y[k] = max(a[k], b[k]) for k < b.size on Spatz (max kernel, element-wise).
+spatz_max = l1_kernel("l1_max_fp16_spatz", operands=("y:out", "a:in", "b:in"), params=("b.size",), executor=CORE)
+# spatz_colmax: m[c] = max_r x[r, c] on Spatz (reducemax kernel, reduce over the first axis).
+spatz_colmax = l1_kernel("l1_colmax_fp16_spatz", operands=("m:out", "x:in"), params=("x.shape[0]", "x.shape[1]"), executor=CORE)
+# spatz_rowsum: s[r] = sum_c x[r, c] on Spatz (reducesum kernel, reduce over the last axis).
+spatz_rowsum = l1_kernel("l1_rowsum_fp16_spatz", operands=("s:out", "x:in"), params=("x.shape[0]", "x.shape[1]"), executor=CORE)
+# spatz_colsum: s[c] = sum_r x[r, c] on Spatz (reducesum kernel, reduce over the first axis).
+spatz_colsum = l1_kernel("l1_colsum_fp16_spatz", operands=("s:out", "x:in"), params=("x.shape[0]", "x.shape[1]"), executor=CORE)
+# spatz_expminus: y[r, c] = exp(x[r, c] - m[r]) on Spatz (expminus kernel).
+spatz_expminus = l1_kernel("l1_expminus_fp16_spatz", operands=("y:out", "x:in", "m:in"), params=("x.shape[0]", "x.shape[1]"), executor=CORE)
+# spatz_sub, spatz_exp, spatz_mul, spatz_add: element-wise y = a - b, y = exp(x), y = a * b, y = a + b on Spatz.
+spatz_sub = l1_kernel("l1_sub_fp16_spatz", operands=("y:out", "a:in", "b:in"), params=("a.size",), executor=CORE)
+spatz_exp = l1_kernel("l1_exp_fp16_spatz", operands=("y:out", "x:in"), params=("x.size",), executor=CORE)
+spatz_mul = l1_kernel("l1_mul_fp16_spatz", operands=("y:out", "a:in", "b:in"), params=("a.size",), executor=CORE)
+spatz_add = l1_kernel("l1_add_fp16_spatz", operands=("y:out", "a:in", "b:in"), params=("a.size",), executor=CORE)
+# spatz_rowscale: y[r, c] = x[r, c] * s[r], i.e. y = diag(s) x, on Spatz (rowscale kernel).
+spatz_rowscale = l1_kernel("l1_rowscale_fp16_spatz", operands=("y:out", "x:in", "s:in"), params=("x.shape[0]", "x.shape[1]"), executor=CORE)
+# spatz_rowdiv: y[r, c] = x[r, c] / s[r], i.e. y = diag(s)^-1 x, on Spatz (rowdiv kernel).
+spatz_rowdiv = l1_kernel("l1_rowdiv_fp16_spatz", operands=("y:out", "x:in", "s:in"), params=("x.shape[0]", "x.shape[1]"), executor=CORE)
+
+@test("test_mgc_flat_attn_naive", authors=["Francesco Conti <francesco.conti@chips.it>"])
+def main():
+
+    # parallel for on tiles
+    for ii, jj in tiles():
+        # spatial sharding of each Q block [Br x P] over the rows and of each K/V block [Bc x P] over the columns
+        tiles_i = ii.split(S_BLOCK_SIZE_Q)
+        tiles_j = jj.split(S_BLOCK_SIZE_KV)
+
+        s_block_size_q:  u16 = S_BLOCK_SIZE_Q
+        s_block_size_kv: u16 = S_BLOCK_SIZE_KV
+        s_block_nb_q:  u8 = S // S_BLOCK_SIZE_Q
+        s_block_nb_kv: u8 = S // S_BLOCK_SIZE_KV
+
+        q  = L1.single_buffer(q_[tiles_i, :])
+        kt = L1.single_buffer(kt_[:, tiles_j])
+        v  = L1.single_buffer(v_[tiles_j, :])
+        o  = L1.single_buffer(o_[tiles_i, :])
+        attn = L1.single_buffer((tiles_i, tiles_j), fp16)
+        rowm = L1.single_buffer((tiles_i,), fp16)
+        rowmprev = L1.single_buffer((tiles_i,), fp16)
+        rows = L1.single_buffer((tiles_i,), fp16)
+        rowsprev = L1.single_buffer((tiles_i,), fp16)
+        # row maxes of all the tiles of this row [MESH_X_TILES x Stile]: only used on tile (ii, 0), but every tile
+        # allocates it so that the L1 layout is the same everywhere
+        rowms = L1.single_buffer((MESH_X_TILES, tiles_i), fp16)
+        # receive buffer for the tree reduction of o
+        ored = L1.single_buffer((tiles_i, P), fp16)
+
+        # sequential loop on tiled S dimension of Q
+        for siq in range(s_block_nb_q):
+            # first row of the slice of Q / O owned by this tile in Q block siq
+            s_start_q: u16 = siq * s_block_size_q + tiles_i.start
+
+            # load Q & row multicast - the latter is currently inefficient (serialized push)
+            # each tile has size [Stile x D]
+            if jj==0:
+                idma.load(q, q_[s_start_q:s_start_q + tiles_i.size, :]).wait()
+                idma.store(q.row, q).wait()
+
+            # reset the output accumulator o [Stile x P] for this Q block
+            memset_zero(o)
+
+            # sequential loop on tiled S dimension of K/V
+            for sikv in range(s_block_nb_kv):
+                # first row of the slice of K / V owned by this tile in K/V block sikv
+                s_start_kv: u16 = sikv * s_block_size_kv + tiles_j.start
+
+                # load K,V & column multicast - the latter is currently inefficient (serialized push)
+                # each tile has size [Stile x D] (transposed for Kt)
+                if ii==0:
+                    idma.load(kt, kt_[:, s_start_kv:s_start_kv + tiles_j.size]).wait()
+                    idma.store(kt.col, kt).wait()
+                    idma.load(v, v_[s_start_kv:s_start_kv + tiles_j.size, :]).wait()
+                    idma.store(v.col, v).wait()
+
+                # all sync
+                sync(GLOBAL)
+
+                # FIXME: this memset is a workaround for the GVSOC model of RedMulE (and the MAGIA SDK) not showing
+                # the feature to do pure matmuls with no accumulation (MATMUL vs GEMM mode).
+                # tiles Q @ Kt -> attn [Stile x Stile]
+                memset_zero(attn)
+                j = redmule.enqueue(q, kt, attn)
+                redmule.commit_start()
+                j.wait()
+
+                # rescale attn [Stile x Stile] by 1/sqrt(P), in place
+                spatz_scale_rsqrt_p(attn, attn)
+
+                # per-tile row max of attn [Stile x Stile] -> rowms[0, :] [Stile] (offset 0 of rowms), gathered into
+                # rowms[jj, :] on tile (ii, 0); tiles in the first column already have it in place.
+                spatz_rowmax(rowms, attn)
+                # online softmax: from the second K/V block on, keep the largest of the new row max and of the current
+                # one, still in rowm from the previous iteration
+                if sikv > 0:
+                    spatz_max(rowms, rowms, rowm)
+                if jj > 0:
+                    idma.store(rowms.at(ii, 0)[jj, :], rowms[0, :]).wait()
+                sync(ROW)
+
+                # row max over the whole S dimension: rowm [Stile] = max over the rows of rowms [MESH_X_TILES x Stile],
+                # then multicast it from tile (ii, 0) to all the other tiles of the row
+                if jj==0:
+                    spatz_colmax(rowm, rowms)
+                    idma.store(rowm.row, rowm).wait()
+                sync(ROW)
+
+                # attn [Stile x Stile] = exp(attn - rowm [Stile]), in place, with rowm broadcast along the columns
+                spatz_expminus(attn, attn, rowm)
+
+                # online softmax: from the second K/V block on, rescaling factor exp(rowmprev - rowm) [Stile] of the
+                # previous blocks to the new max, on every tile, in place in rowmprev
+                if sikv > 0:
+                    spatz_sub(rowmprev, rowmprev, rowm)
+                    spatz_exp(rowmprev, rowmprev)
+
+                # per-tile row sum of attn [Stile x Stile] -> rows [Stile], gathered into rowms[jj, :] on tile (ii, 0)
+                # like the row max (rowm is kept, it is needed later to update the current max).
+                if jj==0:
+                    spatz_rowsum(rowms, attn)
+                else:
+                    spatz_rowsum(rows, attn)
+                    idma.store(rowms.at(ii, 0)[jj, :], rows).wait()
+                sync(ROW)
+
+                # row sum over the whole S dimension: rows [Stile] = sum over the rows of rowms [MESH_X_TILES x Stile],
+                # then multicast it from tile (ii, 0) to all the other tiles of the row.
+                # online softmax: rescale the row sum of the previous blocks to the new
+                # max and accumulate, rows = exp(rowmprev - rowm) * rowsprev + rows.
+                if jj==0:
+                    spatz_colsum(rows, rowms)
+                    if sikv > 0:
+                        spatz_mul(rowsprev, rowmprev, rowsprev)
+                        spatz_add(rows, rowsprev, rows)
+                    idma.store(rows.row, rows).wait()
+                sync(ROW)
+
+                # online softmax: rescale the output accumulator of the previous blocks to the new max,
+                # o [Stile x P] = diag(exp(rowmprev - rowm)) o, in place
+                if sikv > 0:
+                    spatz_rowscale(o, o, rowmprev)
+
+                # accumulate this K/V block into the output: o [Stile x P] += attn [Stile x Stile] @ v [Stile x P]
+                j = redmule.enqueue(attn, v, o)
+                redmule.commit_start()
+                j.wait()
+
+                # keep the row max and row sum of this K/V block in rowmprev and rowsprev on every tile, for the online
+                # softmax rescaling in the next iteration
+                copy(rowmprev, rowm)
+                copy(rowsprev, rows)
+
+                # all the tiles of the column are done with kt and v before tile (0, jj) multicasts the next K/V block
+                sync(COL)
+
+            # end of the online softmax: normalize the output accumulator by the row sum over the whole S dimension,
+            # o [Stile x P] = diag(rows)^-1 o, in place
+            spatz_rowdiv(o, o, rows)
+
+            # row-wise binary-tree reduction of o into tile (ii, 0), which writes it back to o_
+            stride: u8 = 1
+            for lvl in range(MESH_X_TILES):
+                if stride < MESH_X_TILES:
+                    if jj % (2 * stride) == stride:
+                        idma.store(ored.at(ii, jj - stride)[:, :], o).wait()
+                    sync(ROW)
+                    if jj % (2 * stride) == 0 and jj + stride < MESH_X_TILES:
+                        spatz_add(o, o, ored)
+                    sync(ROW)
+                    stride = stride * 2
+            if jj==0:
+                idma.store(o_[s_start_q:s_start_q + tiles_i.size, :], o).wait()
+
+        # check the whole output on tile (0, 0), once every tile of the first column has written its slices
+        sync(GLOBAL)
+        if ii == 0:
+            if jj == 0:
+                check(o_[:, :], o_gold[:, :], tol=0x11)
