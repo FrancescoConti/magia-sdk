@@ -52,7 +52,9 @@ spatz_rowdiv = l1_kernel("l1_rowdiv_fp16_spatz", operands=("y:out", "x:in", "s:i
 @test("test_mgc_flat_attn_naive", authors=["Francesco Conti <francesco.conti@chips.it>"])
 def main():
 
-    # parallel for on tiles
+    """
+    Parallel loop on the mesh-of-tiles
+    """
     for ii, jj in tiles():
         # spatial sharding of each Q block [Br x P] over the rows and of each K/V block [Bc x P] over the columns
         tiles_i = ii.split(S_BLOCK_SIZE_Q)
@@ -72,6 +74,7 @@ def main():
         row_max_prev = L1.single_buffer((tiles_i,), fp16)
         row_sum = L1.single_buffer((tiles_i,), fp16)
         row_sum_prev = L1.single_buffer((tiles_i,), fp16)
+
         # row maxima/sums of all the tiles of this row [MESH_X_TILES x Stile]: only used on tile (ii, 0), but every tile
         # allocates it so that the L1 layout is the same everywhere
         row_gather_buf = L1.single_buffer((MESH_X_TILES, tiles_i), fp16)
@@ -94,6 +97,11 @@ def main():
 
             # sequential loop on tiled S dimension of K/V
             for sikv in range(s_block_nb_kv):
+
+                """
+                STAGE 0: LOAD
+                """
+
                 # first row of the slice of K / V owned by this tile in K/V block sikv
                 s_start_kv: u16 = sikv * s_block_size_kv + tiles_j.start
 
@@ -108,6 +116,10 @@ def main():
                 # all sync
                 sync(GLOBAL)
 
+                """
+                STAGE 1: MATMUL Q @ Kt
+                """
+
                 # tiles Q @ Kt -> attn [Stile x Stile]
                 # FIXME: this memset is a workaround for the GVSOC model of RedMulE (and the MAGIA SDK) not showing
                 # the feature to do pure matmuls with no accumulation (MATMUL vs GEMM mode).
@@ -115,6 +127,10 @@ def main():
                 j = redmule.enqueue(q, kt, attn)
                 redmule.commit_start()
                 j.wait()
+
+                """
+                STAGE 2: SOFTMAX
+                """
 
                 # rescale attn [Stile x Stile] by 1/sqrt(P) in-place
                 spatz_scale_rsqrt_p(attn, attn)
@@ -173,6 +189,10 @@ def main():
                 # rescale the output accumulator of the previous blocks to the new max in-place
                 if sikv > 0:
                     spatz_rowscale(o, o, row_max_prev)
+
+                """
+                STAGE 3: MATMUL Attn @ V
+                """
 
                 # accumulate the block of the current sikv iteration into the output:
                 # o [Stile x P] += attn [Stile x Stile] @ v [Stile x P]
