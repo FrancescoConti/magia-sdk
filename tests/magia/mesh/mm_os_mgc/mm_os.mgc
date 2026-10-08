@@ -81,13 +81,18 @@ def main():
                 b - Multiply and add
                 Synchronization is not required.
                 We parallelize the IDMA with Redmule: the job is programmed while its operands
-                are loaded, committed once they have landed, and waited one step later.
+                are loaded, committed once they have landed (stage 0), and waited one step
+                later (stage 1), while the next timeslot loads.
                 """
-                idma.load(x[i], X[tile_h, i * t_size:(i + 1) * t_size])
-                idma.load(w[i], W[i * t_size:(i + 1) * t_size, tile_w])
-                redmule.enqueue(x[i], w[i], y, event=redmule_evt[i])
-                redmule.commit_start()
-                redmule_evt[i].wait()
+                with stage(0):
+                    ex = idma.load(x[i], X[tile_h, i * t_size:(i + 1) * t_size])
+                    ew = idma.load(w[i], W[i * t_size:(i + 1) * t_size, tile_w])
+                    redmule.enqueue(x[i], w[i], y, event=redmule_evt[i])
+                    ex.wait()
+                    ew.wait()
+                    redmule.commit_start()
+                with stage(1):
+                    redmule_evt[i].wait()
 
             """
             5. Store the output data-tile back to L2

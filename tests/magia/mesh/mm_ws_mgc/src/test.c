@@ -158,6 +158,7 @@ int main(void)
          * row, the bias block), accumulate, then pass the block to the tile below (the bottom
          * row stores it to L2). A global barrier closes every time step.
          */
+        // stage 0: load the blocks of timeslot pt
         if (y_id == 0) {
             mg_idma_memcpy_2d(&idma_ctrl,
                               &eu_ctrl,
@@ -184,6 +185,7 @@ int main(void)
                           &idma_evt_x,
                           NULL);
 
+        // end of the step: wait for the transfers and the job issued above
         if (y_id == 0) {
             mg_idma_wait(&eu_ctrl, 0, WAIT_MODE, &idma_evt_y_in);
         }
@@ -191,6 +193,11 @@ int main(void)
         fsync_sync_global(&fsync_ctrl);
         eu_fsync_wait(&eu_ctrl, WAIT_MODE);
 
+        /**
+         * systolic: 3 stages; step pt runs stage k on iteration pt + 1 - k
+         * y  stages 0..2  depth 3
+         * x  stages 0..1  depth 2
+         */
         for (int t = 0; t < (MESH_Y_TILES - 1) * 2 + timeslots + 1; t++) {
             int pt = t - t_start;
 
@@ -222,6 +229,7 @@ int main(void)
                 }
 
                 if (pt < (timeslots - 1)) {
+                    // stage 0: load the blocks of timeslot pt
                     if (y_id == 0) {
                         mg_idma_memcpy_2d(&idma_ctrl,
                                           &eu_ctrl,
@@ -250,6 +258,7 @@ int main(void)
                 }
 
                 if (pt > 0) {
+                    // stage 2: pass the block of timeslot pt to the next tile (or store it)
                     if (y_id == (MESH_Y_TILES - 1)) {
                         mg_idma_memcpy_2d(&idma_ctrl,
                                           &eu_ctrl,
@@ -276,6 +285,7 @@ int main(void)
                 }
 
                 if (pt < timeslots) {
+                    // stage 1: accumulate the block of timeslot pt
                     mg_redmule_gemm_enqueue(&redmule_ctrl,
                                             &eu_ctrl,
                                             WAIT_MODE,
@@ -291,6 +301,7 @@ int main(void)
                 }
 
                 if (pt < (timeslots - 1)) {
+                    // end of the step: wait for the transfers and the job issued above
                     if (y_id == 0) {
                         mg_idma_wait(&eu_ctrl, 0, WAIT_MODE, &idma_evt_y_in);
                     }

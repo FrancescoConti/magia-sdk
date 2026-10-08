@@ -323,7 +323,7 @@ class Emitter:
     def wait(self, op):
         """Print the wait matching the event: `mg_idma_wait(...)` or `mg_redmule_wait(...)`."""
         e = op.event.data
-        if e.kind == 'idma':
+        if e.kind == 'idma' or (e.kind == 'array' and self.evkinds[e.name] == 'idma'):
             self.w.line(f'mg_idma_wait(&eu_ctrl, {e.dir}, {WAIT_MODE}, {e.cname});')
         else:
             acc = e.name if e.kind == 'hwpe' else self.evkinds[e.name]

@@ -207,7 +207,14 @@ int main(void)
          * b - Multiply and add
          * Synchronization is not required.
          * We parallelize the IDMA with Redmule: the job is programmed while its operands
-         * are loaded, committed once they have landed, and waited one step later.
+         * are loaded, committed once they have landed (stage 0), and waited one step
+         * later (stage 1), while the next timeslot loads.
+         */
+        /**
+         * pipeline: 2 stages; step i runs stage k on iteration i + 1 - k
+         * x            stages 0..1  depth 2
+         * w            stages 0..1  depth 2
+         * redmule_evt  stages 0..1  depth 2
          */
         for (int i = 0; i < timeslots; i++) {
             if (i % 2) {

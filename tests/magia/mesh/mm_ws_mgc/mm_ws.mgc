@@ -59,17 +59,31 @@ def main():
             row, the bias block), accumulate, then pass the block to the tile below (the bottom
             row stores it to L2). A global barrier closes every time step.
             """
-            for pt in pipeline(timeslots, skew=t_start, sync=GLOBAL):
-                if y_id == 0:
-                    idma.load(y[pt], Y[pt * t_size:(pt + 1) * t_size, tile_w])
-                idma.load(x[pt], X[pt * t_size:(pt + 1) * t_size, tile_h])
-                j = redmule.enqueue(x[pt], w, y[pt])
-                redmule.commit_start()
-                j.wait(lag=0)  # the block moves on to the neighbour in the next step
-                if y_id == MESH_Y_TILES - 1:
-                    idma.store(Y[pt * t_size:(pt + 1) * t_size, tile_w], y[pt])
-                else:
-                    idma.store(y.at_rel(1, 0)[pt], y[pt])
+            for pt in systolic(timeslots, skew=t_start, sync=GLOBAL):
+                # stage 0: load the blocks of timeslot pt
+                with stage(0):
+                    if y_id == 0:
+                        ey = idma.load(y[pt], Y[pt * t_size:(pt + 1) * t_size, tile_w])
+                    ex = idma.load(x[pt], X[pt * t_size:(pt + 1) * t_size, tile_h])
+                # stage 2: pass the block of timeslot pt to the next tile (or store it)
+                with stage(2):
+                    if y_id == MESH_Y_TILES - 1:
+                        es = idma.store(Y[pt * t_size:(pt + 1) * t_size, tile_w], y[pt])
+                    else:
+                        es = idma.store(y.at_rel(1, 0)[pt], y[pt])
+                # stage 1: accumulate the block of timeslot pt
+                with stage(1):
+                    j = redmule.enqueue(x[pt], w, y[pt])
+                    redmule.commit_start()
+                # end of the step: wait for the transfers and the job issued above
+                with stage(0):
+                    if y_id == 0:
+                        ey.wait()
+                    ex.wait()
+                with stage(2):
+                    es.wait()
+                with stage(1):
+                    j.wait()
 
         """
         4. Check results

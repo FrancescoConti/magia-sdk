@@ -134,6 +134,7 @@ int main(void)
                       NULL);
     mg_idma_wait(&eu_ctrl, 0, WAIT_MODE, &idma_evt_y);
 
+    // stage 0: load the operands of timeslot i
     mg_idma_memcpy_2d(&idma_ctrl,
                       &eu_ctrl,
                       WAIT_MODE,
@@ -157,9 +158,18 @@ int main(void)
                       reps_w,
                       &idma_evt_w,
                       NULL);
+
+    // end of the step: the loads of stage 0 overlapped the work above
     mg_idma_wait(&eu_ctrl, 0, WAIT_MODE, &idma_evt_x_raw);
     mg_idma_wait(&eu_ctrl, 0, WAIT_MODE, &idma_evt_w);
 
+    /**
+     * pipeline: 3 stages; step i runs stage k on iteration i + 1 - k
+     * x_raw        stages 0..1  depth 2
+     * w            stages 0..2  depth 3
+     * x            stages 1..2  depth 2
+     * redmule_evt  stages 1..2  depth 2
+     */
     for (int i = 0; i < timeslots + 1; i++) {
         if (i % 2) {
             x_raw_pt         = l1_addr_x_raw_1;
@@ -191,6 +201,7 @@ int main(void)
         }
 
         if (i < (timeslots - 1)) {
+            // stage 0: load the operands of timeslot i
             mg_idma_memcpy_2d(&idma_ctrl,
                               &eu_ctrl,
                               WAIT_MODE,
@@ -217,6 +228,7 @@ int main(void)
         }
 
         if (i < timeslots) {
+            // stage 1: program the job while the core converts x, then start it
             mg_redmule_gemm_enqueue(&redmule_ctrl,
                                     &eu_ctrl,
                                     WAIT_MODE,
@@ -234,11 +246,13 @@ int main(void)
         }
 
         if (i < (timeslots - 1)) {
+            // end of the step: the loads of stage 0 overlapped the work above
             mg_idma_wait(&eu_ctrl, 0, WAIT_MODE, &idma_evt_x_raw);
             mg_idma_wait(&eu_ctrl, 0, WAIT_MODE, &idma_evt_w);
         }
 
         if (i > 0) {
+            // stage 2: the job of timeslot i ran behind the one of timeslot i + 1
             mg_redmule_wait(&eu_ctrl, WAIT_MODE, redmule_evt_prev);
         }
     }
