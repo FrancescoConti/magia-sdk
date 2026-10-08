@@ -40,9 +40,11 @@ runs while (3) the CV32 L1 kernels execute, each kernel followed by the
 commits that consume its output; (4) the remaining waits come last, in issue
 order (issues as early as possible, waits as late as possible).
 
-`skew=`/`steps=`/`sync=` make it a systolic pipeline: a global time loop of
-`steps` iterations in which the tile is active when 0 <= t - skew <= last
-step, with a barrier at the end of every time step.
+`skew=` makes it a systolic pipeline: a global time loop, identical on all
+tiles, in which the tile is active when 0 <= t - skew <= last step (with
+`sync=`, a barrier ends every time step). Its length is max(skew + n) + S - 2
+over the mesh: tile-dependent scalars are inlined, and skew + n must be affine
+in the tile ids, so the maximum is at a corner of the mesh.
 
 Code shape matters to GCC (it changes register allocation and the cycle count),
 so the 2-stage shape is the one of the hand-written tests:
@@ -51,6 +53,7 @@ so the 2-stage shape is the one of the hand-written tests:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -400,7 +403,7 @@ class Pipeline(ModulePass):
                                        regions=[_region(loop_body)]))
         else:
             t = p.time.data if p.time is not None else 't'
-            steps = p.steps.data
+            steps = add(self.mesh_max(p, add(skew, n)), Const(S - 2))
             last = add(n, Const(S - 3)) if S >= 3 else sub(n, Const(1))
             active = Logic('&&', [Cmp('>=', step, Const(0)), Cmp('<=', step, last)])
             loop_body = [ir.ScalarOp.create(attributes={'sym': StringAttr(var), 'ctype': StringAttr('int'),
@@ -418,6 +421,44 @@ class Pipeline(ModulePass):
         Rewriter.insert_op(out, InsertPoint.before(p))
         p.detach()
         p.erase()
+
+    @staticmethod
+    def mesh_max(p, e):
+        """Maximum of `e` over all tiles, as an expression valid on every tile.
+
+        Scalars that depend on the tile ids are inlined (they must be declared
+        once); the result must be affine in the tile ids with constant
+        coefficients, so the maximum is at a mesh corner: e.g. `y_id * 2 + n`
+        -> `(MESH_Y_TILES - 1) * 2 + n`."""
+        tiles = p.parent_op()
+        while not isinstance(tiles, ir.TilesOp):
+            tiles = tiles.parent_op()
+        mesh = {tiles.y.data: 'MESH_Y_TILES', tiles.x.data: 'MESH_X_TILES'}
+        dep = set(mesh)  # names whose value differs between tiles
+        defs = {}
+        for op in tiles.walk():
+            if isinstance(op, ir.SplitOp):
+                dep.add(op.sym.data)
+            elif isinstance(op, ir.ScalarOp) and op.value.data.syms() & dep:
+                dep.add(op.sym.data)
+                if op.decl.data:
+                    defs[op.sym.data] = op.value.data
+                else:
+                    defs.pop(op.sym.data, None)  # reassigned: not inlinable
+        while (names := e.syms() & set(defs)):
+            e = e.subst({k: defs[k] for k in names})
+        bad = (e.syms() & dep) - set(mesh)
+        if bad:
+            raise MgcError(p, f'pipeline(): cannot compute the time steps of the mesh: skew + n depends on '
+                              f'{", ".join(sorted(bad))}, which is not a single assignment of the tile ids')
+        poly = e.poly()
+        corner = {}
+        for v, extent in mesh.items():
+            coef = poly.get((v,), 0)
+            if any(re.search(rf'\b{v}\b', a) for k in poly if k != (v,) for a in k):
+                raise MgcError(p, f'pipeline(): skew + n must be affine in {v} with a constant coefficient')
+            corner[v] = sub(Sym(extent), Const(1)) if coef > 0 else Const(0)
+        return e.subst(corner)
 
     @staticmethod
     def sync(p):

@@ -100,10 +100,9 @@ int main(void)
      * 1a. The K dimension is processed in timeslots. Column x_id of the mesh starts 2 time
      * steps after the column to its left.
      */
-    uint8_t timeslots       = 4;
-    uint8_t t_size          = K_SIZE / timeslots;
-    uint8_t t_start         = x_id * 2;
-    uint8_t total_timeslots = (MESH_X_TILES - 1) * 2 + timeslots + 1;
+    uint8_t timeslots = 4;
+    uint8_t t_size    = K_SIZE / timeslots;
+    uint8_t t_start   = x_id * 2;
 
     /**
      * 2. L1 buffers: the static inputs, and multi-buffers for the weight and output blocks.
@@ -193,7 +192,7 @@ int main(void)
         fsync_sync_row(&fsync_ctrl);
         eu_fsync_wait(&eu_ctrl, WAIT_MODE);
 
-        for (int t = 0; t < total_timeslots; t++) {
+        for (int t = 0; t < (MESH_X_TILES - 1) * 2 + timeslots + 1; t++) {
             int pt = t - t_start;
 
             if (pt >= 0 && pt <= timeslots) {

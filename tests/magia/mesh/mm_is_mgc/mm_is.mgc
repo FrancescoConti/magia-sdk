@@ -41,7 +41,6 @@ def main():
         timeslots: u8 = 4
         t_size: u8 = K // timeslots
         t_start: u8 = x_id * 2
-        total_timeslots: u8 = (MESH_X_TILES - 1) * 2 + timeslots + 1
 
         """
         2. L1 buffers: the static inputs, and multi-buffers for the weight and output blocks.
@@ -61,7 +60,7 @@ def main():
             column, the bias block), accumulate, then pass the block to the tile on the right
             (the right column stores it to L2). A row barrier closes every time step.
             """
-            for pt in pipeline(timeslots, skew=t_start, steps=total_timeslots, sync=ROW):
+            for pt in pipeline(timeslots, skew=t_start, sync=ROW):
                 if x_id == 0:
                     idma.load(y[pt], Y[tile_h, pt * t_size:(pt + 1) * t_size])
                 idma.load(w[pt], W[tile_w, pt * t_size:(pt + 1) * t_size])

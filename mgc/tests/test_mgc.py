@@ -154,6 +154,22 @@ class Systolic(unittest.TestCase):
             _c(WS, 'x.mgc', src)
         self.assertIn('live across 3 pipeline stages', str(cm.exception))
 
+    def test_time_steps_computed(self):
+        # max(skew + n) + S - 2 over the mesh, skew = t_start = y_id * 2 inlined
+        self.assertIn('for (int t = 0; t < (MESH_Y_TILES - 1) * 2 + timeslots + 1; t++) {', _c(WS, 'mm_ws.mgc'))
+        # a negative coefficient picks the other corner
+        src = _read(WS, 'mm_ws.mgc').replace('t_start: u8 = y_id * 2', 't_start: u8 = 6 - y_id * 2')
+        self.assertIn('t < 6 + timeslots + 1;', _c(WS, 'x.mgc', src))
+
+    def test_time_steps_checks(self):
+        src = _read(WS, 'mm_ws.mgc')
+        with self.assertRaisesRegex(MgcError, 'computed by mgc'):
+            _c(WS, 'x.mgc', src.replace('skew=t_start,', 'skew=t_start, steps=9,'))
+        with self.assertRaisesRegex(MgcError, 'affine in y_id'):
+            _c(WS, 'x.mgc', src.replace('t_start: u8 = y_id * 2', 't_start: u8 = y_id * y_id'))
+        with self.assertRaisesRegex(MgcError, 'depends on tile_h'):
+            _c(WS, 'x.mgc', src.replace('skew=t_start', 'skew=tile_h.size'))
+
 
 class Kernels(unittest.TestCase):
 

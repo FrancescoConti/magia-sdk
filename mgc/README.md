@@ -62,7 +62,6 @@ for y_id, x_id in tiles():
     timeslots: u8 = 4
     t_size: u8 = M // timeslots
     t_start: u8 = y_id * 2
-    total_timeslots: u8 = (MESH_Y_TILES - 1) * 2 + timeslots + 1
 
     w = L1.single_buffer(W[tile_h, tile_w])
     x = L1.multi_buffer(X[0:t_size, tile_h], depth=2)
@@ -70,7 +69,7 @@ for y_id, x_id in tiles():
 
     for z in range(N_ITERATIONS):
         idma.load(w, W[tile_h, tile_w]).wait()
-        for pt in pipeline(timeslots, skew=t_start, steps=total_timeslots, sync=GLOBAL):
+        for pt in pipeline(timeslots, skew=t_start, sync=GLOBAL):
             if y_id == 0:
                 idma.load(y[pt], Y[pt * t_size:(pt + 1) * t_size, tile_w])
             idma.load(x[pt], X[pt * t_size:(pt + 1) * t_size, tile_h])
@@ -194,29 +193,95 @@ shapes: `name.shape[i]`, `name.size` (elements) or `name.bytes`. The C function 
 operand addresses, then the parameters, all as `uint32_t`, and must be provided by the test
 (e.g. `src/kernels.c`).
 
-### `pipeline(n, skew=None, steps=None, sync=None)`
+### `pipeline(n, skew=None, sync=None, time="t")`
 
-The body describes one iteration `i`: transfers, jobs, CV32 kernel calls and HWPE protocol steps,
-with transfers and jobs optionally inside `if` statements that do not depend on `i`. The compiler:
+`for i in pipeline(n): body` is a software pipeline over `n` iterations. The body is written
+as if iterations ran one after the other: it describes iteration `i` only, with transfers, jobs,
+CV32 kernel calls and HWPE protocol steps (transfers and jobs may sit inside `if` statements that
+do not depend on `i`). The compiler splits the body into **stages** and overlaps them, so that
+while iteration `i` computes, iteration `i + 1` loads and iteration `i - 1` stores.
+
+| Argument | Meaning |
+|---|---|
+| `n` | number of iterations of the body (`i = 0 … n-1`), i.e. the trip count of the loop as written |
+| `sync=SCOPE` | `GLOBAL`, `ROW` or `COL`: a barrier after the prologue and at the end of every step (needed when tiles exchange data inside the pipeline) |
+| `skew` | makes the pipeline **systolic**: this tile starts `skew` steps after tile 0, inside a time loop shared by all tiles (see below) |
+| `time="t"` | name of the time-loop variable of a systolic pipeline |
+
+#### Stages and steps
+
+The compiler works in three phases:
 
 1. **Assigns stages.** An item is placed one stage after the latest earlier item that writes a
-   slot it reads; otherwise it is in stage 0. Examples: load (0) → kernel (1) → store (2).
-   HWPE protocol steps follow their own rules (below).
-2. **Checks depths.** Each multi-buffer must have at least as many slots as the number of stages
-   its slots are live across. Each HWPE can hold `queue_depth` jobs (2 for RedMulE), and each job
+   slot it reads; otherwise it is in stage 0. For example, load (0) → kernel (1) → store (2).
+   HWPE protocol steps follow their own rules (see [HWPE jobs](#hwpe-jobs)). A pipeline with
+   `S` stages needs `n + S - 1` **steps** to run all `n` iterations through all stages.
+2. **Checks depths.** A multi-buffer slot is live from the first to the last stage that touches
+   it, so the buffer needs at least that many slots (e.g. `y` loaded in stage 0 and stored in
+   stage 2 needs `depth=3`). Each HWPE can hold `queue_depth` jobs (2 for RedMulE), and each job
    in flight needs its own event.
-3. **Generates the schedule.** A prologue runs stage 0 of iteration 0. In loop step `s`,
-   stage `k` works on iteration `s + 1 - k`, guarded by `0 <= s + 1 - k < n`. A step runs in four
-   phases:
-   1. transfers, enqueues and `redmule.gemm` one-shots are issued;
-   2. commits/starts follow, each after the waits of the DMAs it needs, so the HWPE computes
-      while the core is busy with the next phase;
-   3. CV32 kernel calls, each followed by the commits that consume its output;
-   4. the remaining waits, in issue order.
+3. **Generates the schedule.** A **step** is one pass over all the stages, each working on a
+   different iteration: in step `s`, stage `k` works on iteration `s + 1 - k`, and is skipped
+   unless `0 <= s + 1 - k < n`. The first step (`s = -1`, stage 0 of iteration 0 only) is
+   emitted before the loop as the **prologue**; the loop runs the remaining `n + S - 2` steps
+   (`s = 0 … n + S - 3`), whose first and last ones (fill and drain) have some stages switched
+   off by the guards.
 
-With `skew` and `steps`, the loop runs over `steps` global time steps. The tile is active when
-`0 <= t - skew <= last step`. `sync=SCOPE` adds a barrier after the prologue and at the end of
-every time step, active or not.
+With `n = 4` and `S = 3` (load → gemm → store), the steps are:
+
+| step `s` | stage 0: load | stage 1: gemm | stage 2: store |
+|---|---|---|---|
+| prologue | `i = 0` | – | – |
+| 0 | `i = 1` | `i = 0` | – |
+| 1 | `i = 2` | `i = 1` | `i = 0` |
+| 2 | `i = 3` | `i = 2` | `i = 1` |
+| 3 | – | `i = 3` | `i = 2` |
+| 4 | – | – | `i = 3` |
+
+Within a step, the operations of all active stages are emitted in four phases (issues as early
+as possible, waits as late as possible):
+
+1. transfers, enqueues and `redmule.gemm` one-shots are issued;
+2. commits/starts follow, each after the waits of the DMAs it needs, so the HWPE computes
+   while the core is busy with the next phase;
+3. CV32 kernel calls, each followed by the commits that consume its output;
+4. the remaining waits, in issue order.
+
+#### Systolic pipelines: `skew`
+
+In a systolic schedule (e.g. weight-static GEMM, `tests/magia/mesh/mm_ws_mgc`), data flows from
+tile to tile, so a tile can only start once its neighbour has produced its first block: row
+`y_id` of the mesh starts a few steps after row `y_id - 1`. At the same time, `sync=GLOBAL`
+barriers only work if **every tile calls them the same number of times**, including tiles that
+have not started yet or have already finished.
+
+`skew` solves this by wrapping the pipeline steps in a global time loop (the `sync()` calls are
+emitted only with `sync=`):
+
+```c
+/* prologue (stage 0 of iteration 0, on every tile) */
+sync();
+for (int t = 0; t < max(skew + n) + S - 2; t++) {   // computed by mgc, same on all tiles
+    int i = t - skew;                    // this tile's delay, may differ per tile
+    if (i >= 0 && i <= n + S - 3) {      // S: number of stages
+        /* pipeline step i, as above */
+    }
+    sync();                              // every tile, active or not
+}
+```
+
+- `skew` is the delay, in steps, of this tile with respect to tile 0; it is usually a function
+  of `y_id`/`x_id` (in `mm_ws`, `skew = 2 * y_id`: a block takes one step to compute and one
+  to travel to the tile below).
+- The length of the time loop is computed by mgc: it must be the same on every tile and cover
+  the latest one, so it is `max(skew + n) + S - 2` over the mesh. mgc inlines the
+  scalars that depend on the tile ids (`t_start` → `y_id * 2`), requires the result to be affine
+  in `y_id`/`x_id` with constant coefficients, and takes the maximum at the corresponding mesh
+  corner. In `mm_ws` (`S = 3`) this gives `(MESH_Y_TILES - 1) * 2 + timeslots + 1`.
+
+A tile is therefore idle (only taking part in the barriers) for the first `skew` time steps and
+after its `n + S - 2` loop steps are done. The prologue is not delayed by `skew`: it runs on
+every tile before the time loop.
 
 #### HWPE jobs
 
@@ -274,7 +339,8 @@ and the last stage prints C against mglib. Each pass can be inspected on its own
 common mistakes. In particular:
 - it **decides** tile sizes and borders, L1 addresses (identical on all tiles), L2 offsets,
   iDMA length/stride/repetition, 1-D vs 2-D transfer selection, buffer rotation, event variables,
-  HWPE job sequence, and the guarded stage schedule of `pipeline()`.
+  HWPE job sequence, the guarded stage schedule of `pipeline()` and the length of its systolic
+  time loop.
 - it **rejects** views that the iDMA cannot express, accelerator operands with the wrong shape,
   pipelines deeper than their buffers, and events that are waited on without being issued
   (or reused before the previous transfer/job on it was waited).

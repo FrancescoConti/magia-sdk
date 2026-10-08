@@ -361,7 +361,6 @@ class PipelineOp(_Region):
     var = attr_def(StringAttr)
     n = attr_def(ExprAttr)
     skew = opt_attr_def(ExprAttr)
-    steps = opt_attr_def(ExprAttr)
     sync = opt_attr_def(StringAttr)
     time = opt_attr_def(StringAttr)
     body = region_def()

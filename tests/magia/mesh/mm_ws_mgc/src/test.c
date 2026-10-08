@@ -99,10 +99,9 @@ int main(void)
      * 1a. The M dimension is processed in timeslots. Row y_id of the mesh starts 2 time
      * steps after the row above it (a block takes one step to compute, one to travel down).
      */
-    uint8_t timeslots       = 4;
-    uint8_t t_size          = M_SIZE / timeslots;
-    uint8_t t_start         = y_id * 2;
-    uint8_t total_timeslots = (MESH_Y_TILES - 1) * 2 + timeslots + 1;
+    uint8_t timeslots = 4;
+    uint8_t t_size    = M_SIZE / timeslots;
+    uint8_t t_start   = y_id * 2;
 
     /**
      * 2. L1 buffers: the static weights, and multi-buffers for the input and output blocks.
@@ -192,7 +191,7 @@ int main(void)
         fsync_sync_global(&fsync_ctrl);
         eu_fsync_wait(&eu_ctrl, WAIT_MODE);
 
-        for (int t = 0; t < total_timeslots; t++) {
+        for (int t = 0; t < (MESH_Y_TILES - 1) * 2 + timeslots + 1; t++) {
             int pt = t - t_start;
 
             if (pt >= 0 && pt <= timeslots) {

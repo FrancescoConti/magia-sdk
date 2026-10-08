@@ -1083,10 +1083,11 @@ class Frontend:
         """Time loops inside the tile loop.
 
         - `for i in range(n)` / `range(a, b)` -> plain loop (`mg.for`);
-        - `for pt in pipeline(n, skew=S, steps=T, sync=SCOPE)` -> software
-          pipeline over `n` iterations (`mg.pipeline`); `skew` and `steps` must
-          be given together (this tile starts `S` steps late out of `T` total),
-          `sync` adds a barrier per step, `time` is a label.
+        - `for pt in pipeline(n, skew=S, sync=SCOPE)` -> software pipeline
+          over `n` iterations (`mg.pipeline`); with `skew`, this tile starts
+          `S` steps late in a time loop shared by the mesh (its length is
+          computed by the pipeline pass), `sync` adds a barrier per step,
+          `time` names the time-loop variable.
 
         The loop variable is only in scope inside the body. `tiles()` and
         `cores()` are rejected here.
@@ -1118,7 +1119,7 @@ class Frontend:
                 raise MgcError(s, 'pipeline(n, ...) takes one trip count')
             attrs = {'var': StringAttr(var), 'n': ir.E(self.expr(args[0]))}
             for kw in s.iter.keywords:
-                if kw.arg in ('skew', 'steps'):
+                if kw.arg == 'skew':
                     attrs[kw.arg] = ir.E(self.expr(kw.value))
                 elif kw.arg == 'sync':
                     sc = _name(kw.value)
@@ -1127,10 +1128,10 @@ class Frontend:
                     attrs['sync'] = StringAttr(sc)
                 elif kw.arg == 'time':
                     attrs['time'] = StringAttr(ast.literal_eval(kw.value))
+                elif kw.arg == 'steps':
+                    raise MgcError(s, 'pipeline(): `steps=` is computed by mgc from `skew` and `n`; remove it')
                 else:
                     raise MgcError(s, f'unknown pipeline() argument {kw.arg}')
-            if ('skew' in attrs) != ('steps' in attrs):
-                raise MgcError(s, 'pipeline(): `skew=` needs `steps=` (total time steps of the mesh)')
 
             def enter():
                 self.env[var] = Sym(var, None, 'int')
