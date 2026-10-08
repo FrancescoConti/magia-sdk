@@ -625,6 +625,21 @@ def main():
         self.assertError('ev = redmule.events(2)', 'ev = redmule.events(2)\n        z = L1.multi_buffer(X[0:t_size, :])',
                          '`z` is not used by a pipeline()')
 
+    def test_last_slot_after_the_loop(self):
+        # constant trip count: LAST = steps - 1 = 3 is fixed slot 3 % 3 = 0
+        store = '        idma.store(Y[0:t_size, tile_w], y[LAST]).wait()\n'
+        c = _c(OS, 'x.mgc', self.SRC + store)
+        self.assertIn('l1_addr_y_0,', c[c.rindex('l2_addr_y,'):])
+        # run-time trip count: `i_last` picks the slot, pointers are still declared before the loop
+        c = _c(OS, 'x.mgc', (self.SRC + store).replace('pipeline(steps)', 'pipeline(t_size - x_id)'))
+        self.assertIn('int i_last = t_size - x_id - 1;', c)
+        self.assertLess(c.index('volatile uint32_t y_pt;'), c.index('for (int i = 0'))
+        self.assertLess(c.index('int i_last'), c.index('switch (i_last % 3) {'))
+
+    def test_last_outside_a_pipeline(self):
+        self.assertError('        for i in pipeline(steps):', '        idma.store(Y[0:t_size, tile_w], y[LAST]).wait()\n'
+                         '        for i in pipeline(steps):', 'use it after the loop')
+
     def test_if_on_loop_variable(self):
         c = self.c(('                es = idma.store(', '                if i > 0:\n                    es = idma.store('))
         self.assertIn('if ((i - 1) > 0) {', c)

@@ -253,6 +253,14 @@ at the end of the body runs at the end of every step: issuing the loads of stage
 waiting them last lets them overlap the work of the later stages in between (see
 `tests/magia/mesh/mm_os_l1k` and the systolic example above).
 
+#### After the loop: `LAST`
+
+After a `pipeline()` / `systolic()` loop, `b[LAST]` is the slot of its last iteration `n - 1`,
+e.g. a running result kept in a multi-buffer (`LAST - 1` etc. work as well). With a constant
+`n` it is a fixed slot; otherwise mgc declares `int i_last = n - 1;` after the loop and selects
+the slot with it (`switch (i_last % N)`). `LAST` refers to the most recent such loop and is an
+error before any.
+
 #### Depths
 
 A storage indexed `[i + c]`, a multi-buffer slot or an event-array entry, that is touched in

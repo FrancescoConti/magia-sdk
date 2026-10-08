@@ -467,6 +467,8 @@ class Emitter:
         ops = list(self.tiles.body.block.ops)
         cut = 0
         for k, op in enumerate(ops):
+            if isinstance(op, ir.ForOp):
+                break  # declarations go before the first loop (e.g. not after a pipeline's `i_last`)
             if isinstance(op, DECLARATIVE) or (isinstance(op, ir.ScalarOp) and op.decl.data):
                 cut = k + 1
         self.block(ops[:cut])

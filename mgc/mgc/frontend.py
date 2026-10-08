@@ -509,6 +509,8 @@ class Frontend:
         if isinstance(n, ast.Constant) and isinstance(n.value, int) and not isinstance(n.value, bool):
             return Const(n.value)
         if isinstance(n, ast.Name):
+            if n.id == 'LAST' and n.id not in self.env:
+                raise MgcError(n, '`LAST` is the last iteration of a pipeline() or systolic(): use it after the loop')
             if n.id not in self.env:
                 raise MgcError(n, f'undefined name `{n.id}`')
             v = self.env[n.id]
@@ -1136,6 +1138,17 @@ class Frontend:
             self.env.pop(var, None)
         else:
             self.env[var] = saved
+        if fn != 'range':
+            # LAST: the last iteration, n - 1, to pick its slots after the loop (`row_sum[LAST]`)
+            last = sub(attrs['n'].data, Const(1))
+            if last.value() is not None:
+                last = Const(last.value())
+            else:
+                lname = f'{var}_last'
+                self.add(ir.ScalarOp.create(attributes={'sym': StringAttr(lname), 'ctype': StringAttr('int'),
+                                                        'value': ir.E(last), 'decl': IntAttr(1)}), s)
+                last = Sym(lname, None, 'int')
+            self.env['LAST'] = last
 
 
     def stages(self, s, fn, enter):
