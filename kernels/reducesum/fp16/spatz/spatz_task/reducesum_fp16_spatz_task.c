@@ -53,12 +53,14 @@ static inline void reduce_sum_contiguous(const _Float16 *src, _Float16 *dst, con
     _Float16 sum;
 
     asm volatile("vsetvli %0, %1, e16, m8, ta, ma" : "=r"(vl) : "r"(avl));
-    asm volatile("vfmv.s.f v16, %0" ::"f"(src[0]));
 
-    /* src[0] is already in the accumulator: skipping it realigns a 2 mod 4 row start. */
+    /* A 2 mod 4 row start is realigned by moving src[0] into the accumulator and skipping it. */
     if (MISALIGNED(src)) {
+        asm volatile("vfmv.s.f v16, %0" ::"f"(src[0]));
         src++;
         avl--;
+    } else {
+        asm volatile("vfmv.s.f v16, %0" ::"f"((_Float16)0.0f));
     }
 
     for (; avl > 0; avl -= vl) {
