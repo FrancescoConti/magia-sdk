@@ -42,6 +42,10 @@ file(GLOB_RECURSE TEST_SRCS
 
 add_executable(${TEST_NAME} ${TEST_SRCS} ${SPATZ_KERNEL_SRCS})
 add_dependencies(${TEST_NAME} ${mgc_flat_attn_naive_spatz_SPATZ_TARGET})
+# Spatz boots from spatz_init.bin (as in add_cv32_executable_with_spatz)
+if(TARGET spatz_bootrom)
+  add_dependencies(${TEST_NAME} spatz_bootrom)
+endif()
 target_include_directories(${TEST_NAME} PUBLIC include)
 target_include_directories(${TEST_NAME} PRIVATE ${SPATZ_KERNEL_INCS} ${SPATZ_HEADER_DIR})
 set_source_files_properties(${SPATZ_KERNEL_SRCS} PROPERTIES INCLUDE_DIRECTORIES ${SPATZ_SHIM_DIR})
