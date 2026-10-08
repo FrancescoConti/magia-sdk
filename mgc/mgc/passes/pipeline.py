@@ -15,7 +15,8 @@ at the end of the step waits the DMAs issued by the first one.
 Checks:
 * depth: a storage indexed `[i + c]` (multi-buffer slot or event-array entry)
   touched in stages a..b holds b - a + 1 iterations at once, so it needs
-  depth >= b - a + 1. A transfer or job keeps its operands (and its event)
+  depth >= b - a + 1. A use of `[i + c]` in stage k counts as stage k - c
+  (it is iteration i + c's slot). A transfer or job keeps its operands (and its event)
   until the stage of its wait. An omitted depth is inferred.
 * a single buffer written in the loop is touched in one stage only (else the
   next iteration overwrites it): use a multi-buffer indexed `[i]`. Operands of
@@ -503,8 +504,10 @@ class Pipeline(ModulePass):
     def depths(self, module, uses, issues, var, kdefs, remote):
         """Stages touched by each storage indexed `[var + c]`: an op touches its
         buffers in its stage, and keeps those of a transfer/job (and its event)
-        until its wait. Infers omitted depths, checks the others, and checks the
-        single-buffer rule. Returns the schedule table [(name, lo, hi, depth)]."""
+        until its wait. Slot `var + c` in stage k belongs to iteration var + c,
+        for which it is stage k - c. Infers omitted depths, checks the others,
+        and checks the single-buffer rule. Returns the schedule table
+        [(name, lo, hi, depth)]."""
         last = {id(it.use.op): it.last for it in issues}
         span, single = {}, {}
         allocs = {}
@@ -513,8 +516,9 @@ class Pipeline(ModulePass):
             for a, slot, written in _buffers(u.op, var, kdefs, remote):
                 allocs[a.sym.data] = a
                 if slot[0] == 'rel' and a.depth.data != 1:
-                    lo0, hi0 = span.get(('buf', a.sym.data), (u.k, hi))
-                    span[('buf', a.sym.data)] = (min(lo0, u.k), max(hi0, hi))
+                    c = slot[1]
+                    lo0, hi0 = span.get(('buf', a.sym.data), (u.k - c, hi - c))
+                    span[('buf', a.sym.data)] = (min(lo0, u.k - c), max(hi0, hi - c))
                 else:
                     st, w = single.get(a.sym.data, (set(), False))
                     single[a.sym.data] = (st | {u.k}, w or written)
@@ -528,9 +532,9 @@ class Pipeline(ModulePass):
         evarrays = {o.sym.data: o for o in module.walk() if isinstance(o, ir.EventsOp)}
         for it in issues:
             if it.key[0] == 'array' and it.key[3][0] == 'rel':
-                k = ('evt', it.key[1])
-                lo0, hi0 = span.get(k, (it.use.k, it.last))
-                span[k] = (min(lo0, it.use.k), max(hi0, it.last))
+                k, c = ('evt', it.key[1]), it.key[3][1]
+                lo0, hi0 = span.get(k, (it.use.k - c, it.last - c))
+                span[k] = (min(lo0, it.use.k - c), max(hi0, it.last - c))
         table = []
         for (kind, name), (lo, hi) in span.items():
             op = allocs[name] if kind == 'buf' else evarrays[name]

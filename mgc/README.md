@@ -256,7 +256,9 @@ waiting them last lets them overlap the work of the later stages in between (see
 #### Depths
 
 A storage indexed `[i + c]`, a multi-buffer slot or an event-array entry, that is touched in
-stages `a..b` is in use by `b - a + 1` iterations at once, so it needs **depth ≥ b − a + 1**. A
+stages `a..b` is in use by `b - a + 1` iterations at once, so it needs **depth ≥ b − a + 1**.
+A use of `[i + c]` in stage `k` touches the slot of iteration `i + c`, so it counts as its
+stage `k - c`: e.g. `m[i - 1]` read in stage 2 keeps `m`'s slot busy until stage 3. A
 transfer or job keeps its buffers and its event busy until the stage of its `.wait()`. In the
 load → gemm → store example, `y` is loaded in stage 0 and stored in stage 2: `depth=3`. A
 multi-buffer without `depth=` (or `redmule.events()` without a size) gets exactly that (at least

@@ -616,6 +616,11 @@ def main():
         for line in ('x   stages 0..1  depth 2', 'y   stages 0..2  depth 3', 'ev  stages 0..1  depth 2'):
             self.assertIn(line, c)
 
+    def test_depth_slot_offset(self):
+        # y[i - 1] in stage 2 is iteration i - 1's slot, i.e. its stage 3
+        self.assertError('Y[i * t_size:(i + 1) * t_size, tile_w], y[i])', 'Y[i * t_size:(i + 1) * t_size, tile_w], y[i - 1])',
+                         'used in stages 0..3, so it holds 4 iterations at once')
+
     def test_inferred_depth_needs_a_pipeline(self):
         self.assertError('ev = redmule.events(2)', 'ev = redmule.events(2)\n        z = L1.multi_buffer(X[0:t_size, :])',
                          '`z` is not used by a pipeline()')
