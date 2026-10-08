@@ -134,46 +134,46 @@ int main(void)
     if (tiles_i < 1 || tiles_j < 1) {
         return 0;
     }
-    uint16_t s_block_size_q   = S_BLOCK_SIZE_Q;
-    uint16_t s_block_size_kv  = S_BLOCK_SIZE_KV;
-    uint8_t s_block_nb_q      = SEQ_LENGTH / S_BLOCK_SIZE_Q;
-    uint8_t s_block_nb_kv     = SEQ_LENGTH / S_BLOCK_SIZE_KV;
-    uint32_t len_q            = tiles_i * PROJ_SIZE * 2;
-    uint32_t l1_addr_q        = (l1_tile_base);
-    uint32_t l2_addr_q        = (uint32_t)q_inp + (tiles_i_max * ii * PROJ_SIZE * 2);
-    uint32_t len_kt           = tiles_j * 2;
-    uint32_t std_kt           = SEQ_LENGTH * 2;
-    uint32_t reps_kt          = (uint32_t)PROJ_SIZE;
-    uint32_t l1_addr_kt       = l1_addr_q + (tiles_i_max * PROJ_SIZE * 2);
-    uint32_t l2_addr_kt       = (uint32_t)k_inp + (tiles_j_max * jj * 2);
-    uint32_t len_v            = tiles_j * PROJ_SIZE * 2;
-    uint32_t l1_addr_v        = l1_addr_kt + (PROJ_SIZE * tiles_j_max * 2);
-    uint32_t l2_addr_v        = (uint32_t)v_inp + (tiles_j_max * jj * PROJ_SIZE * 2);
-    uint32_t len_o            = tiles_i * PROJ_SIZE * 2;
-    uint32_t l1_addr_o        = l1_addr_v + (tiles_j_max * PROJ_SIZE * 2);
-    uint32_t l2_addr_o        = (uint32_t)o_out + (tiles_i_max * ii * PROJ_SIZE * 2);
-    uint32_t len_attn         = tiles_i * tiles_j * 2;
-    uint32_t l1_addr_attn     = l1_addr_o + (tiles_i_max * PROJ_SIZE * 2);
-    uint32_t len_rowm         = tiles_i * 2;
-    uint32_t l1_addr_rowm     = l1_addr_attn + (tiles_i_max * tiles_j_max * 2);
-    uint32_t len_rowmprev     = tiles_i * 2;
-    uint32_t l1_addr_rowmprev = l1_addr_rowm + (tiles_i_max * 2);
-    uint32_t len_rows         = tiles_i * 2;
-    uint32_t l1_addr_rows     = l1_addr_rowmprev + (tiles_i_max * 2);
-    uint32_t len_rowsprev     = tiles_i * 2;
-    uint32_t l1_addr_rowsprev = l1_addr_rows + (tiles_i_max * 2);
+    uint16_t s_block_size_q       = S_BLOCK_SIZE_Q;
+    uint16_t s_block_size_kv      = S_BLOCK_SIZE_KV;
+    uint8_t s_block_nb_q          = SEQ_LENGTH / S_BLOCK_SIZE_Q;
+    uint8_t s_block_nb_kv         = SEQ_LENGTH / S_BLOCK_SIZE_KV;
+    uint32_t len_q                = tiles_i * PROJ_SIZE * 2;
+    uint32_t l1_addr_q            = (l1_tile_base);
+    uint32_t l2_addr_q            = (uint32_t)q_inp + (tiles_i_max * ii * PROJ_SIZE * 2);
+    uint32_t len_kt               = tiles_j * 2;
+    uint32_t std_kt               = SEQ_LENGTH * 2;
+    uint32_t reps_kt              = (uint32_t)PROJ_SIZE;
+    uint32_t l1_addr_kt           = l1_addr_q + (tiles_i_max * PROJ_SIZE * 2);
+    uint32_t l2_addr_kt           = (uint32_t)k_inp + (tiles_j_max * jj * 2);
+    uint32_t len_v                = tiles_j * PROJ_SIZE * 2;
+    uint32_t l1_addr_v            = l1_addr_kt + (PROJ_SIZE * tiles_j_max * 2);
+    uint32_t l2_addr_v            = (uint32_t)v_inp + (tiles_j_max * jj * PROJ_SIZE * 2);
+    uint32_t len_o                = tiles_i * PROJ_SIZE * 2;
+    uint32_t l1_addr_o            = l1_addr_v + (tiles_j_max * PROJ_SIZE * 2);
+    uint32_t l2_addr_o            = (uint32_t)o_out + (tiles_i_max * ii * PROJ_SIZE * 2);
+    uint32_t len_attn             = tiles_i * tiles_j * 2;
+    uint32_t l1_addr_attn         = l1_addr_o + (tiles_i_max * PROJ_SIZE * 2);
+    uint32_t len_row_max          = tiles_i * 2;
+    uint32_t l1_addr_row_max      = l1_addr_attn + (tiles_i_max * tiles_j_max * 2);
+    uint32_t len_row_max_prev     = tiles_i * 2;
+    uint32_t l1_addr_row_max_prev = l1_addr_row_max + (tiles_i_max * 2);
+    uint32_t len_row_sum          = tiles_i * 2;
+    uint32_t l1_addr_row_sum      = l1_addr_row_max_prev + (tiles_i_max * 2);
+    uint32_t len_row_sum_prev     = tiles_i * 2;
+    uint32_t l1_addr_row_sum_prev = l1_addr_row_sum + (tiles_i_max * 2);
 
-    // row maxes of all the tiles of this row [MESH_X_TILES x Stile]: only used on tile (ii, 0), but
-    // every tile allocates it so that the L1 layout is the same everywhere
-    uint32_t len_rowms     = MESH_X_TILES * tiles_i * 2;
-    uint32_t l1_addr_rowms = l1_addr_rowsprev + (tiles_i_max * 2);
+    // row maxima/sums of all the tiles of this row [MESH_X_TILES x Stile]: only used on tile (ii,
+    // 0), but every tile allocates it so that the L1 layout is the same everywhere
+    uint32_t len_row_gather_buf     = MESH_X_TILES * tiles_i * 2;
+    uint32_t l1_addr_row_gather_buf = l1_addr_row_sum_prev + (tiles_i_max * 2);
 
     // receive buffer for the tree reduction of o
-    uint32_t len_ored     = tiles_i * PROJ_SIZE * 2;
-    uint32_t l1_addr_ored = l1_addr_rowms + (MESH_X_TILES * tiles_i_max * 2);
+    uint32_t len_o_tree_recv_buf     = tiles_i * PROJ_SIZE * 2;
+    uint32_t l1_addr_o_tree_recv_buf = l1_addr_row_gather_buf + (MESH_X_TILES * tiles_i_max * 2);
 
-    mg_event_t idma_evt_q, idma_evt_kt, idma_evt_v, idma_evt_o, idma_evt_rowm, idma_evt_rows,
-        idma_evt_rowms;
+    mg_event_t idma_evt_q, idma_evt_kt, idma_evt_v, idma_evt_o, idma_evt_row_max, idma_evt_row_sum,
+        idma_evt_row_gather_buf;
     mg_event_t redmule_evt;
 
     // sequential loop on tiled S dimension of Q
@@ -283,9 +283,10 @@ int main(void)
             fsync_sync_global(&fsync_ctrl);
             eu_fsync_wait(&eu_ctrl, WAIT_MODE);
 
+            // tiles Q @ Kt -> attn [Stile x Stile]
             // FIXME: this memset is a workaround for the GVSOC model of RedMulE (and the MAGIA SDK)
             // not showing the feature to do pure matmuls with no accumulation (MATMUL vs GEMM
-            // mode). tiles Q @ Kt -> attn [Stile x Stile]
+            // mode).
             l1_memset_zero_fp16(l1_addr_attn, tiles_i * tiles_j);
 
             mg_redmule_gemm_enqueue(&redmule_ctrl,
@@ -302,137 +303,141 @@ int main(void)
             mg_redmule_gemm_commit_start(&redmule_ctrl);
             mg_redmule_wait(&eu_ctrl, WAIT_MODE, &redmule_evt);
 
-            // rescale attn [Stile x Stile] by 1/sqrt(P), in place
+            // rescale attn [Stile x Stile] by 1/sqrt(P) in-place
             l1_scale_rsqrt_p_fp16_spatz(l1_addr_attn, l1_addr_attn, tiles_i * tiles_j);
 
-            // per-tile row max of attn [Stile x Stile] -> rowms[0, :] [Stile] (offset 0 of rowms),
-            // gathered into rowms[jj, :] on tile (ii, 0); tiles in the first column already have it
-            // in place.
-            l1_rowmax_fp16_spatz(l1_addr_rowms, l1_addr_attn, tiles_i, tiles_j);
+            // per-tile row max of attn [Stile x Stile] -> row_gather_buf[0, :] [Stile]
+            l1_rowmax_fp16_spatz(l1_addr_row_gather_buf, l1_addr_attn, tiles_i, tiles_j);
 
-            // online softmax: from the second K/V block on, keep the largest of the new row max and
-            // of the current one, still in rowm from the previous iteration
+            // from the second K/V block on, keep the largest of the new row max and of the previous
+            // one
             if (sikv > 0) {
-                l1_max_fp16_spatz(l1_addr_rowms, l1_addr_rowms, l1_addr_rowm, tiles_i);
+                l1_max_fp16_spatz(
+                    l1_addr_row_gather_buf, l1_addr_row_gather_buf, l1_addr_row_max_prev, tiles_i);
             }
 
+            // gather all row maxima from tiles horizontally into the first column tiles
             if (jj > 0) {
                 mg_idma_memcpy_1d(&idma_ctrl,
                                   &eu_ctrl,
                                   WAIT_MODE,
                                   1,
                                   get_l1_base(GET_ID(ii, 0)) +
-                                      (l1_addr_rowms + (jj * tiles_i * 2) - l1_tile_base),
-                                  l1_addr_rowms,
+                                      (l1_addr_row_gather_buf + (jj * tiles_i * 2) - l1_tile_base),
+                                  l1_addr_row_gather_buf,
                                   tiles_i * 2,
-                                  &idma_evt_rowms,
+                                  &idma_evt_row_gather_buf,
                                   NULL);
-                mg_idma_wait(&eu_ctrl, 1, WAIT_MODE, &idma_evt_rowms);
+                mg_idma_wait(&eu_ctrl, 1, WAIT_MODE, &idma_evt_row_gather_buf);
             }
             fsync_sync_row(&fsync_ctrl);
             eu_fsync_wait(&eu_ctrl, WAIT_MODE);
 
-            // row max over the whole S dimension: rowm [Stile] = max over the rows of rowms
-            // [MESH_X_TILES x Stile], then multicast it from tile (ii, 0) to all the other tiles of
-            // the row
+            // row max over the whole S dimension:
+            // row_max [Stile] = max over the rows of row_gather_buf [MESH_X_TILES x Stile],
+            // then multicast it from tiles in the first column to all the other tiles of the row
             if (jj == 0) {
-                l1_colmax_fp16_spatz(l1_addr_rowm, l1_addr_rowms, MESH_X_TILES, tiles_i);
+                l1_colmax_fp16_spatz(
+                    l1_addr_row_max, l1_addr_row_gather_buf, MESH_X_TILES, tiles_i);
 
-                for (uint32_t mcast_rowm = 0; mcast_rowm < MESH_X_TILES; mcast_rowm++) {
-                    if (mcast_rowm != jj) {
+                for (uint32_t mcast_row_max = 0; mcast_row_max < MESH_X_TILES; mcast_row_max++) {
+                    if (mcast_row_max != jj) {
                         mg_idma_memcpy_1d(&idma_ctrl,
                                           &eu_ctrl,
                                           WAIT_MODE,
                                           1,
-                                          get_l1_base(GET_ID(ii, mcast_rowm)) +
-                                              (l1_addr_rowm - l1_tile_base),
-                                          l1_addr_rowm,
+                                          get_l1_base(GET_ID(ii, mcast_row_max)) +
+                                              (l1_addr_row_max - l1_tile_base),
+                                          l1_addr_row_max,
                                           tiles_i * 2,
-                                          &idma_evt_rowm,
+                                          &idma_evt_row_max,
                                           NULL);
                     }
                 }
-                mg_idma_wait(&eu_ctrl, 1, WAIT_MODE, &idma_evt_rowm);
+                mg_idma_wait(&eu_ctrl, 1, WAIT_MODE, &idma_evt_row_max);
             }
             fsync_sync_row(&fsync_ctrl);
             eu_fsync_wait(&eu_ctrl, WAIT_MODE);
 
-            // attn [Stile x Stile] = exp(attn - rowm [Stile]), in place, with rowm broadcast along
-            // the columns
-            l1_expminus_fp16_spatz(l1_addr_attn, l1_addr_attn, l1_addr_rowm, tiles_i, tiles_j);
+            // attn [Stile x Stile] = exp(attn - row_max [Stile]), in-place, with row_max broadcast
+            // along the columns
+            l1_expminus_fp16_spatz(l1_addr_attn, l1_addr_attn, l1_addr_row_max, tiles_i, tiles_j);
 
-            // online softmax: from the second K/V block on, rescaling factor exp(rowmprev - rowm)
-            // [Stile] of the previous blocks to the new max, on every tile, in place in rowmprev
+            // from the second K/V block on, compute the rescaling factor exp(row_max_prev -
+            // row_max) in-place in row_max_prev
             if (sikv > 0) {
-                l1_sub_fp16_spatz(l1_addr_rowmprev, l1_addr_rowmprev, l1_addr_rowm, tiles_i);
+                l1_sub_fp16_spatz(
+                    l1_addr_row_max_prev, l1_addr_row_max_prev, l1_addr_row_max, tiles_i);
 
-                l1_exp_fp16_spatz(l1_addr_rowmprev, l1_addr_rowmprev, tiles_i);
+                l1_exp_fp16_spatz(l1_addr_row_max_prev, l1_addr_row_max_prev, tiles_i);
             }
 
-            // per-tile row sum of attn [Stile x Stile] -> rows [Stile], gathered into rowms[jj, :]
-            // on tile (ii, 0) like the row max (rowm is kept, it is needed later to update the
-            // current max).
+            // per-tile row sum of attn [Stile x Stile] -> row_gather_buf[0, :] on the first column,
+            // elsewhere row_sum [Stile], gathered into row_gather_buf[jj, :] on the first column
             if (jj == 0) {
-                l1_rowsum_fp16_spatz(l1_addr_rowms, l1_addr_attn, tiles_i, tiles_j);
+                l1_rowsum_fp16_spatz(l1_addr_row_gather_buf, l1_addr_attn, tiles_i, tiles_j);
             } else {
-                l1_rowsum_fp16_spatz(l1_addr_rows, l1_addr_attn, tiles_i, tiles_j);
+                l1_rowsum_fp16_spatz(l1_addr_row_sum, l1_addr_attn, tiles_i, tiles_j);
 
                 mg_idma_memcpy_1d(&idma_ctrl,
                                   &eu_ctrl,
                                   WAIT_MODE,
                                   1,
                                   get_l1_base(GET_ID(ii, 0)) +
-                                      (l1_addr_rowms + (jj * tiles_i * 2) - l1_tile_base),
-                                  l1_addr_rows,
+                                      (l1_addr_row_gather_buf + (jj * tiles_i * 2) - l1_tile_base),
+                                  l1_addr_row_sum,
                                   tiles_i * 2,
-                                  &idma_evt_rows,
+                                  &idma_evt_row_sum,
                                   NULL);
-                mg_idma_wait(&eu_ctrl, 1, WAIT_MODE, &idma_evt_rows);
+                mg_idma_wait(&eu_ctrl, 1, WAIT_MODE, &idma_evt_row_sum);
             }
             fsync_sync_row(&fsync_ctrl);
             eu_fsync_wait(&eu_ctrl, WAIT_MODE);
 
-            // row sum over the whole S dimension: rows [Stile] = sum over the rows of rowms
-            // [MESH_X_TILES x Stile], then multicast it from tile (ii, 0) to all the other tiles of
-            // the row. online softmax: rescale the row sum of the previous blocks to the new max
-            // and accumulate, rows = exp(rowmprev - rowm) * rowsprev + rows.
+            // row sum over the whole S dimension:
+            // row_sum [Stile] = sum over the rows of row_gather_buf [MESH_X_TILES x Stile],
+            // then multicast it from tiles in the first column to all the other tiles of the row.
             if (jj == 0) {
-                l1_colsum_fp16_spatz(l1_addr_rows, l1_addr_rowms, MESH_X_TILES, tiles_i);
+                l1_colsum_fp16_spatz(
+                    l1_addr_row_sum, l1_addr_row_gather_buf, MESH_X_TILES, tiles_i);
 
+                // from the second K/V block on, rescale the previous row sum row_sum_prev by
+                // exp(row_max_prev - row_max) and add it to row_sum
                 if (sikv > 0) {
                     l1_mul_fp16_spatz(
-                        l1_addr_rowsprev, l1_addr_rowmprev, l1_addr_rowsprev, tiles_i);
+                        l1_addr_row_sum_prev, l1_addr_row_max_prev, l1_addr_row_sum_prev, tiles_i);
 
-                    l1_add_fp16_spatz(l1_addr_rows, l1_addr_rowsprev, l1_addr_rows, tiles_i);
+                    l1_add_fp16_spatz(
+                        l1_addr_row_sum, l1_addr_row_sum_prev, l1_addr_row_sum, tiles_i);
                 }
 
-                for (uint32_t mcast_rows = 0; mcast_rows < MESH_X_TILES; mcast_rows++) {
-                    if (mcast_rows != jj) {
+                for (uint32_t mcast_row_sum = 0; mcast_row_sum < MESH_X_TILES; mcast_row_sum++) {
+                    if (mcast_row_sum != jj) {
                         mg_idma_memcpy_1d(&idma_ctrl,
                                           &eu_ctrl,
                                           WAIT_MODE,
                                           1,
-                                          get_l1_base(GET_ID(ii, mcast_rows)) +
-                                              (l1_addr_rows - l1_tile_base),
-                                          l1_addr_rows,
+                                          get_l1_base(GET_ID(ii, mcast_row_sum)) +
+                                              (l1_addr_row_sum - l1_tile_base),
+                                          l1_addr_row_sum,
                                           tiles_i * 2,
-                                          &idma_evt_rows,
+                                          &idma_evt_row_sum,
                                           NULL);
                     }
                 }
-                mg_idma_wait(&eu_ctrl, 1, WAIT_MODE, &idma_evt_rows);
+                mg_idma_wait(&eu_ctrl, 1, WAIT_MODE, &idma_evt_row_sum);
             }
             fsync_sync_row(&fsync_ctrl);
             eu_fsync_wait(&eu_ctrl, WAIT_MODE);
 
-            // online softmax: rescale the output accumulator of the previous blocks to the new max,
-            // o [Stile x P] = diag(exp(rowmprev - rowm)) o, in place
+            // rescale the output accumulator of the previous blocks to the new max in-place
             if (sikv > 0) {
-                l1_rowscale_fp16_spatz(l1_addr_o, l1_addr_o, l1_addr_rowmprev, tiles_i, PROJ_SIZE);
+                l1_rowscale_fp16_spatz(
+                    l1_addr_o, l1_addr_o, l1_addr_row_max_prev, tiles_i, PROJ_SIZE);
             }
 
-            // accumulate this K/V block into the output: o [Stile x P] += attn [Stile x Stile] @ v
-            // [Stile x P]
+            // accumulate the block of the current sikv iteration into the output:
+            // o [Stile x P] += attn [Stile x Stile] @ v [Stile x P]
             mg_redmule_gemm_enqueue(&redmule_ctrl,
                                     &eu_ctrl,
                                     WAIT_MODE,
@@ -447,11 +452,12 @@ int main(void)
             mg_redmule_gemm_commit_start(&redmule_ctrl);
             mg_redmule_wait(&eu_ctrl, WAIT_MODE, &redmule_evt);
 
-            // keep the row max and row sum of this K/V block in rowmprev and rowsprev on every
-            // tile, for the online softmax rescaling in the next iteration
-            l1_copy_fp16(l1_addr_rowmprev, l1_addr_rowm, tiles_i);
+            // keep the row max and row sum of the block of the current K/V iteration in
+            // row_max_prev and row_sum_prev on every tile, for the online softmax rescaling in the
+            // next iteration
+            l1_copy_fp16(l1_addr_row_max_prev, l1_addr_row_max, tiles_i);
 
-            l1_copy_fp16(l1_addr_rowsprev, l1_addr_rows, tiles_i);
+            l1_copy_fp16(l1_addr_row_sum_prev, l1_addr_row_sum, tiles_i);
 
             // all the tiles of the column are done with kt and v before tile (0, jj) multicasts the
             // next K/V block
@@ -459,9 +465,9 @@ int main(void)
             eu_fsync_wait(&eu_ctrl, WAIT_MODE);
         }
 
-        // end of the online softmax: normalize the output accumulator by the row sum over the whole
-        // S dimension, o [Stile x P] = diag(rows)^-1 o, in place
-        l1_rowdiv_fp16_spatz(l1_addr_o, l1_addr_o, l1_addr_rows, tiles_i, PROJ_SIZE);
+        // normalize the output accumulator by the row sum over the whole S dimension,
+        // o [Stile x P] = o / row_sum in-place where / is a row-wise division
+        l1_rowdiv_fp16_spatz(l1_addr_o, l1_addr_o, l1_addr_row_sum, tiles_i, PROJ_SIZE);
 
         // row-wise binary-tree reduction of o into tile (ii, 0), which writes it back to o_
         uint8_t stride = 1;
@@ -474,7 +480,7 @@ int main(void)
                                       WAIT_MODE,
                                       1,
                                       get_l1_base(GET_ID(ii, jj - stride)) +
-                                          (l1_addr_ored - l1_tile_base),
+                                          (l1_addr_o_tree_recv_buf - l1_tile_base),
                                       l1_addr_o,
                                       tiles_i * PROJ_SIZE * 2,
                                       &idma_evt_o,
@@ -485,7 +491,8 @@ int main(void)
                 eu_fsync_wait(&eu_ctrl, WAIT_MODE);
 
                 if ((jj % (2 * stride)) == 0 && (jj + stride) < MESH_X_TILES) {
-                    l1_add_fp16_spatz(l1_addr_o, l1_addr_o, l1_addr_ored, tiles_i * PROJ_SIZE);
+                    l1_add_fp16_spatz(
+                        l1_addr_o, l1_addr_o, l1_addr_o_tree_recv_buf, tiles_i * PROJ_SIZE);
                 }
                 fsync_sync_row(&fsync_ctrl);
                 eu_fsync_wait(&eu_ctrl, WAIT_MODE);

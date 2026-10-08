@@ -68,15 +68,15 @@ def main():
         v  = L1.single_buffer(v_[tiles_j, :])
         o  = L1.single_buffer(o_[tiles_i, :])
         attn = L1.single_buffer((tiles_i, tiles_j), fp16)
-        rowm = L1.single_buffer((tiles_i,), fp16)
-        rowmprev = L1.single_buffer((tiles_i,), fp16)
-        rows = L1.single_buffer((tiles_i,), fp16)
-        rowsprev = L1.single_buffer((tiles_i,), fp16)
-        # row maxes of all the tiles of this row [MESH_X_TILES x Stile]: only used on tile (ii, 0), but every tile
+        row_max = L1.single_buffer((tiles_i,), fp16)
+        row_max_prev = L1.single_buffer((tiles_i,), fp16)
+        row_sum = L1.single_buffer((tiles_i,), fp16)
+        row_sum_prev = L1.single_buffer((tiles_i,), fp16)
+        # row maxima/sums of all the tiles of this row [MESH_X_TILES x Stile]: only used on tile (ii, 0), but every tile
         # allocates it so that the L1 layout is the same everywhere
-        rowms = L1.single_buffer((MESH_X_TILES, tiles_i), fp16)
+        row_gather_buf = L1.single_buffer((MESH_X_TILES, tiles_i), fp16)
         # receive buffer for the tree reduction of o
-        ored = L1.single_buffer((tiles_i, P), fp16)
+        o_tree_recv_buf = L1.single_buffer((tiles_i, P), fp16)
 
         # sequential loop on tiled S dimension of Q
         for siq in range(s_block_nb_q):
@@ -108,96 +108,99 @@ def main():
                 # all sync
                 sync(GLOBAL)
 
+                # tiles Q @ Kt -> attn [Stile x Stile]
                 # FIXME: this memset is a workaround for the GVSOC model of RedMulE (and the MAGIA SDK) not showing
                 # the feature to do pure matmuls with no accumulation (MATMUL vs GEMM mode).
-                # tiles Q @ Kt -> attn [Stile x Stile]
                 memset_zero(attn)
                 j = redmule.enqueue(q, kt, attn)
                 redmule.commit_start()
                 j.wait()
 
-                # rescale attn [Stile x Stile] by 1/sqrt(P), in place
+                # rescale attn [Stile x Stile] by 1/sqrt(P) in-place
                 spatz_scale_rsqrt_p(attn, attn)
 
-                # per-tile row max of attn [Stile x Stile] -> rowms[0, :] [Stile] (offset 0 of rowms), gathered into
-                # rowms[jj, :] on tile (ii, 0); tiles in the first column already have it in place.
-                spatz_rowmax(rowms, attn)
-                # online softmax: from the second K/V block on, keep the largest of the new row max and of the current
-                # one, still in rowm from the previous iteration
+                # per-tile row max of attn [Stile x Stile] -> row_gather_buf[0, :] [Stile]
+                spatz_rowmax(row_gather_buf, attn)
+
+                # from the second K/V block on, keep the largest of the new row max and of the previous one
                 if sikv > 0:
-                    spatz_max(rowms, rowms, rowm)
+                    spatz_max(row_gather_buf, row_gather_buf, row_max_prev)
+
+                # gather all row maxima from tiles horizontally into the first column tiles
                 if jj > 0:
-                    idma.store(rowms.at(ii, 0)[jj, :], rowms[0, :]).wait()
+                    idma.store(row_gather_buf.at(ii, 0)[jj, :], row_gather_buf[0, :]).wait()
                 sync(ROW)
 
-                # row max over the whole S dimension: rowm [Stile] = max over the rows of rowms [MESH_X_TILES x Stile],
-                # then multicast it from tile (ii, 0) to all the other tiles of the row
+                # row max over the whole S dimension:
+                # row_max [Stile] = max over the rows of row_gather_buf [MESH_X_TILES x Stile],
+                # then multicast it from tiles in the first column to all the other tiles of the row
                 if jj==0:
-                    spatz_colmax(rowm, rowms)
-                    idma.store(rowm.row, rowm).wait()
+                    spatz_colmax(row_max, row_gather_buf)
+                    idma.store(row_max.row, row_max).wait()
                 sync(ROW)
 
-                # attn [Stile x Stile] = exp(attn - rowm [Stile]), in place, with rowm broadcast along the columns
-                spatz_expminus(attn, attn, rowm)
+                # attn [Stile x Stile] = exp(attn - row_max [Stile]), in-place, with row_max broadcast along the columns
+                spatz_expminus(attn, attn, row_max)
 
-                # online softmax: from the second K/V block on, rescaling factor exp(rowmprev - rowm) [Stile] of the
-                # previous blocks to the new max, on every tile, in place in rowmprev
+                # from the second K/V block on, compute the rescaling factor exp(row_max_prev - row_max)
+                # in-place in row_max_prev
                 if sikv > 0:
-                    spatz_sub(rowmprev, rowmprev, rowm)
-                    spatz_exp(rowmprev, rowmprev)
+                    spatz_sub(row_max_prev, row_max_prev, row_max)
+                    spatz_exp(row_max_prev, row_max_prev)
 
-                # per-tile row sum of attn [Stile x Stile] -> rows [Stile], gathered into rowms[jj, :] on tile (ii, 0)
-                # like the row max (rowm is kept, it is needed later to update the current max).
+                # per-tile row sum of attn [Stile x Stile] -> row_gather_buf[0, :] on the first column, elsewhere
+                # row_sum [Stile], gathered into row_gather_buf[jj, :] on the first column
                 if jj==0:
-                    spatz_rowsum(rowms, attn)
+                    spatz_rowsum(row_gather_buf, attn)
                 else:
-                    spatz_rowsum(rows, attn)
-                    idma.store(rowms.at(ii, 0)[jj, :], rows).wait()
+                    spatz_rowsum(row_sum, attn)
+                    idma.store(row_gather_buf.at(ii, 0)[jj, :], row_sum).wait()
                 sync(ROW)
 
-                # row sum over the whole S dimension: rows [Stile] = sum over the rows of rowms [MESH_X_TILES x Stile],
-                # then multicast it from tile (ii, 0) to all the other tiles of the row.
-                # online softmax: rescale the row sum of the previous blocks to the new
-                # max and accumulate, rows = exp(rowmprev - rowm) * rowsprev + rows.
+                # row sum over the whole S dimension:
+                # row_sum [Stile] = sum over the rows of row_gather_buf [MESH_X_TILES x Stile],
+                # then multicast it from tiles in the first column to all the other tiles of the row.
                 if jj==0:
-                    spatz_colsum(rows, rowms)
+                    spatz_colsum(row_sum, row_gather_buf)
+                    # from the second K/V block on, rescale the previous row sum row_sum_prev by
+                    # exp(row_max_prev - row_max) and add it to row_sum
                     if sikv > 0:
-                        spatz_mul(rowsprev, rowmprev, rowsprev)
-                        spatz_add(rows, rowsprev, rows)
-                    idma.store(rows.row, rows).wait()
+                        spatz_mul(row_sum_prev, row_max_prev, row_sum_prev)
+                        spatz_add(row_sum, row_sum_prev, row_sum)
+                    idma.store(row_sum.row, row_sum).wait()
                 sync(ROW)
 
-                # online softmax: rescale the output accumulator of the previous blocks to the new max,
-                # o [Stile x P] = diag(exp(rowmprev - rowm)) o, in place
+                # rescale the output accumulator of the previous blocks to the new max in-place
                 if sikv > 0:
-                    spatz_rowscale(o, o, rowmprev)
+                    spatz_rowscale(o, o, row_max_prev)
 
-                # accumulate this K/V block into the output: o [Stile x P] += attn [Stile x Stile] @ v [Stile x P]
+                # accumulate the block of the current sikv iteration into the output:
+                # o [Stile x P] += attn [Stile x Stile] @ v [Stile x P]
                 j = redmule.enqueue(attn, v, o)
                 redmule.commit_start()
                 j.wait()
 
-                # keep the row max and row sum of this K/V block in rowmprev and rowsprev on every tile, for the online
-                # softmax rescaling in the next iteration
-                copy(rowmprev, rowm)
-                copy(rowsprev, rows)
+                # keep the row max and row sum of the block of the current K/V iteration in row_max_prev
+                # and row_sum_prev on every tile, for the online softmax rescaling in the next iteration
+                copy(row_max_prev, row_max)
+                copy(row_sum_prev, row_sum)
 
                 # all the tiles of the column are done with kt and v before tile (0, jj) multicasts the next K/V block
                 sync(COL)
 
-            # end of the online softmax: normalize the output accumulator by the row sum over the whole S dimension,
-            # o [Stile x P] = diag(rows)^-1 o, in place
-            spatz_rowdiv(o, o, rows)
+            # normalize the output accumulator by the row sum over the whole S dimension,
+            # o [Stile x P] = o / row_sum in-place where / is a row-wise division
+            spatz_rowdiv(o, o, row_sum)
 
             # row-wise binary-tree reduction of o into tile (ii, 0), which writes it back to o_
             stride: u8 = 1
             for lvl in range(MESH_X_TILES):
                 if stride < MESH_X_TILES:
                     if jj % (2 * stride) == stride:
-                        idma.store(ored.at(ii, jj - stride)[:, :], o).wait()
+                        idma.store(o_tree_recv_buf.at(ii, jj - stride)[:, :], o).wait()
                     sync(ROW)
                     if jj % (2 * stride) == 0 and jj + stride < MESH_X_TILES:
-                        spatz_add(o, o, ored)
+                        spatz_add(o, o, o_tree_recv_buf)
                     sync(ROW)
                     stride = stride * 2
             if jj==0:
