@@ -23,7 +23,6 @@
 #include "rowscale_fp16_spatz.h"
 #include "sub_fp16_spatz.h"
 #include "eventunit.h"
-#include "kernel_idma_utils.h"
 #include "mgc_flat_attn_naive_spatz_task_bin.h"
 
 /* Per-tile flag: Spatz is set up on each tile before its first task. */
@@ -36,12 +35,10 @@ static volatile uint8_t spatz_ready[NUM_HARTS];
 static void spatz_setup(void)
 {
     uint32_t hid = get_hartid();
-    eu_controller_t eu_ctrl;
 
     if (spatz_ready[hid])
         return;
-    eu_ctrl_init(&eu_ctrl);
-    eu_spatz_init(&eu_ctrl, 0);
+    eu_spatz_init(0);
     spatz_init(SPATZ_BINARY_START);
     spatz_ready[hid] = 1;
 }

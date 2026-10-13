@@ -32,32 +32,12 @@ int main(void)
      */
     uint32_t hartid = get_hartid();
 
-    idma_config_t idma_cfg      = {.hartid = hartid};
-    idma_controller_t idma_ctrl = {
-        .base = NULL,
-        .cfg  = &idma_cfg,
-        .api  = &idma_api,
-    };
+    idma_init();
+    redmule_init();
 
-    redmule_config_t redmule_cfg      = {.hartid = hartid};
-    redmule_controller_t redmule_ctrl = {
-        .base = NULL,
-        .cfg  = &redmule_cfg,
-        .api  = &redmule_api,
-    };
-
-    idma_init(&idma_ctrl);
-    redmule_init(&redmule_ctrl);
-
-    eu_config_t eu_cfg      = {.hartid = hartid};
-    eu_controller_t eu_ctrl = {
-        .base = NULL,
-        .cfg  = &eu_cfg,
-        .api  = &eu_api,
-    };
-    eu_init(&eu_ctrl);
-    eu_redmule_init(&eu_ctrl, 0);
-    eu_idma_init(&eu_ctrl, 0);
+    eu_init();
+    eu_redmule_init(0);
+    eu_idma_init(0);
 
     uint32_t y_id         = GET_Y_ID(hartid);
     uint32_t x_id         = GET_X_ID(hartid);
@@ -148,45 +128,16 @@ int main(void)
          * 3. Load the static output tile, then run the timeslots as a software pipeline:
          * the operands of timeslot i+1 are prefetched while RedMulE computes timeslot i.
          */
-        mg_idma_memcpy_2d(&idma_ctrl,
-                          &eu_ctrl,
-                          WAIT_MODE,
-                          0,
-                          l2_addr_y,
-                          l1_addr_y,
-                          len_y,
-                          std_y,
-                          reps_y,
-                          &idma_evt_y,
-                          NULL);
+        mg_idma_memcpy_2d(
+            WAIT_MODE, 0, l2_addr_y, l1_addr_y, len_y, std_y, reps_y, &idma_evt_y, NULL);
 
-        mg_idma_memcpy_2d(&idma_ctrl,
-                          &eu_ctrl,
-                          WAIT_MODE,
-                          0,
-                          l2_addr_x,
-                          l1_addr_x_0,
-                          len_x,
-                          std_x,
-                          reps_x,
-                          &idma_evt_x,
-                          NULL);
+        mg_idma_memcpy_2d(
+            WAIT_MODE, 0, l2_addr_x, l1_addr_x_0, len_x, std_x, reps_x, &idma_evt_x, NULL);
 
-        mg_idma_memcpy_2d(&idma_ctrl,
-                          &eu_ctrl,
-                          WAIT_MODE,
-                          0,
-                          l2_addr_w,
-                          l1_addr_w_0,
-                          len_w,
-                          std_w,
-                          reps_w,
-                          &idma_evt_w,
-                          NULL);
+        mg_idma_memcpy_2d(
+            WAIT_MODE, 0, l2_addr_w, l1_addr_w_0, len_w, std_w, reps_w, &idma_evt_w, NULL);
 
-        mg_redmule_gemm_enqueue(&redmule_ctrl,
-                                &eu_ctrl,
-                                WAIT_MODE,
+        mg_redmule_gemm_enqueue(WAIT_MODE,
                                 l1_addr_x_0,
                                 l1_addr_w_0,
                                 l1_addr_y,
@@ -195,10 +146,10 @@ int main(void)
                                 (uint16_t)tile_w,
                                 &redmule_evt_0,
                                 NULL);
-        mg_idma_wait(&eu_ctrl, 0, WAIT_MODE, &idma_evt_x);
-        mg_idma_wait(&eu_ctrl, 0, WAIT_MODE, &idma_evt_w);
-        mg_idma_wait(&eu_ctrl, 0, WAIT_MODE, &idma_evt_y);
-        mg_redmule_gemm_commit_start(&redmule_ctrl);
+        mg_idma_wait(0, WAIT_MODE, &idma_evt_x);
+        mg_idma_wait(0, WAIT_MODE, &idma_evt_w);
+        mg_idma_wait(0, WAIT_MODE, &idma_evt_y);
+        mg_redmule_gemm_commit_start();
 
         /**
          * 4. Cycle over the timeslots.
@@ -234,9 +185,7 @@ int main(void)
             }
 
             if (i < (timeslots - 1)) {
-                mg_idma_memcpy_2d(&idma_ctrl,
-                                  &eu_ctrl,
-                                  WAIT_MODE,
+                mg_idma_memcpy_2d(WAIT_MODE,
                                   0,
                                   l2_addr_x + ((i + 1) * t_size * 2),
                                   x_pt_next,
@@ -246,9 +195,7 @@ int main(void)
                                   &idma_evt_x,
                                   NULL);
 
-                mg_idma_memcpy_2d(&idma_ctrl,
-                                  &eu_ctrl,
-                                  WAIT_MODE,
+                mg_idma_memcpy_2d(WAIT_MODE,
                                   0,
                                   l2_addr_w + ((i + 1) * t_size * K_SIZE * 2),
                                   w_pt_next,
@@ -258,9 +205,7 @@ int main(void)
                                   &idma_evt_w,
                                   NULL);
 
-                mg_redmule_gemm_enqueue(&redmule_ctrl,
-                                        &eu_ctrl,
-                                        WAIT_MODE,
+                mg_redmule_gemm_enqueue(WAIT_MODE,
                                         x_pt_next,
                                         w_pt_next,
                                         l1_addr_y,
@@ -269,30 +214,21 @@ int main(void)
                                         (uint16_t)tile_w,
                                         redmule_evt_next,
                                         NULL);
-                mg_idma_wait(&eu_ctrl, 0, WAIT_MODE, &idma_evt_x);
-                mg_idma_wait(&eu_ctrl, 0, WAIT_MODE, &idma_evt_w);
-                mg_redmule_gemm_commit_start(&redmule_ctrl);
-                mg_redmule_wait(&eu_ctrl, WAIT_MODE, redmule_evt_curr);
+                mg_idma_wait(0, WAIT_MODE, &idma_evt_x);
+                mg_idma_wait(0, WAIT_MODE, &idma_evt_w);
+                mg_redmule_gemm_commit_start();
+                mg_redmule_wait(WAIT_MODE, redmule_evt_curr);
             } else {
-                mg_redmule_wait(&eu_ctrl, WAIT_MODE, redmule_evt_curr);
+                mg_redmule_wait(WAIT_MODE, redmule_evt_curr);
             }
         }
 
         /**
          * 5. Store the output data-tile back to L2
          */
-        mg_idma_memcpy_2d(&idma_ctrl,
-                          &eu_ctrl,
-                          WAIT_MODE,
-                          1,
-                          l2_addr_y,
-                          l1_addr_y,
-                          len_y,
-                          std_y,
-                          reps_y,
-                          &idma_evt_y,
-                          NULL);
-        mg_idma_wait(&eu_ctrl, 1, WAIT_MODE, &idma_evt_y);
+        mg_idma_memcpy_2d(
+            WAIT_MODE, 1, l2_addr_y, l1_addr_y, len_y, std_y, reps_y, &idma_evt_y, NULL);
+        mg_idma_wait(1, WAIT_MODE, &idma_evt_y);
     }
 
     /**

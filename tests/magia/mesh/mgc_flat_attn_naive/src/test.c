@@ -16,8 +16,8 @@
 #include "mg_event.h"
 
 #define WAIT_MODE       WFE
-#define S_BLOCK_SIZE_Q  512
-#define S_BLOCK_SIZE_KV 512
+#define S_BLOCK_SIZE_Q  64
+#define S_BLOCK_SIZE_KV 64
 
 /** L1 kernel (CORE): all pointers are L1 addresses. */
 extern void l1_memset_zero_fp16(uint32_t y, uint32_t p0);
@@ -64,6 +64,9 @@ extern void l1_rowscale_fp16_spatz(uint32_t y, uint32_t x, uint32_t s, uint32_t 
 /** L1 kernel (CORE): all pointers are L1 addresses. */
 extern void l1_rowdiv_fp16_spatz(uint32_t y, uint32_t x, uint32_t s, uint32_t p0, uint32_t p1);
 
+/**
+ * Parallel loop on the mesh-of-tiles
+ */
 int main(void)
 {
     /**
@@ -72,41 +75,14 @@ int main(void)
      */
     uint32_t hartid = get_hartid();
 
-    idma_config_t idma_cfg      = {.hartid = hartid};
-    idma_controller_t idma_ctrl = {
-        .base = NULL,
-        .cfg  = &idma_cfg,
-        .api  = &idma_api,
-    };
+    fsync_init();
+    idma_init();
+    redmule_init();
 
-    redmule_config_t redmule_cfg      = {.hartid = hartid};
-    redmule_controller_t redmule_ctrl = {
-        .base = NULL,
-        .cfg  = &redmule_cfg,
-        .api  = &redmule_api,
-    };
-
-    fsync_config_t fsync_cfg      = {.hartid = hartid};
-    fsync_controller_t fsync_ctrl = {
-        .base = NULL,
-        .cfg  = &fsync_cfg,
-        .api  = &fsync_api,
-    };
-
-    fsync_init(&fsync_ctrl);
-    idma_init(&idma_ctrl);
-    redmule_init(&redmule_ctrl);
-
-    eu_config_t eu_cfg      = {.hartid = hartid};
-    eu_controller_t eu_ctrl = {
-        .base = NULL,
-        .cfg  = &eu_cfg,
-        .api  = &eu_api,
-    };
-    eu_init(&eu_ctrl);
-    eu_redmule_init(&eu_ctrl, 0);
-    eu_idma_init(&eu_ctrl, 0);
-    eu_fsync_init(&eu_ctrl, 0);
+    eu_init();
+    eu_redmule_init(0);
+    eu_idma_init(0);
+    eu_fsync_init(0);
 
     uint32_t ii           = GET_Y_ID(hartid);
     uint32_t jj           = GET_X_ID(hartid);
@@ -184,22 +160,18 @@ int main(void)
         // load Q & row multicast - the latter is currently inefficient (serialized push)
         // each tile has size [Stile x D]
         if (jj == 0) {
-            mg_idma_memcpy_1d(&idma_ctrl,
-                              &eu_ctrl,
-                              WAIT_MODE,
+            mg_idma_memcpy_1d(WAIT_MODE,
                               0,
                               l2_addr_q + ((s_start_q - tiles_i_max * ii) * PROJ_SIZE * 2),
                               l1_addr_q,
                               len_q,
                               &idma_evt_q,
                               NULL);
-            mg_idma_wait(&eu_ctrl, 0, WAIT_MODE, &idma_evt_q);
+            mg_idma_wait(0, WAIT_MODE, &idma_evt_q);
 
             for (uint32_t mcast_q = 0; mcast_q < MESH_X_TILES; mcast_q++) {
                 if (mcast_q != jj) {
-                    mg_idma_memcpy_1d(&idma_ctrl,
-                                      &eu_ctrl,
-                                      WAIT_MODE,
+                    mg_idma_memcpy_1d(WAIT_MODE,
                                       1,
                                       get_l1_base(GET_ID(ii, mcast_q)) + (l1_addr_q - l1_tile_base),
                                       l1_addr_q,
@@ -208,7 +180,7 @@ int main(void)
                                       NULL);
                 }
             }
-            mg_idma_wait(&eu_ctrl, 1, WAIT_MODE, &idma_evt_q);
+            mg_idma_wait(1, WAIT_MODE, &idma_evt_q);
         }
 
         // reset the output accumulator o [Stile x P] for this Q block
@@ -216,15 +188,16 @@ int main(void)
 
         // sequential loop on tiled S dimension of K/V
         for (int sikv = 0; sikv < s_block_nb_kv; sikv++) {
+            /**
+             * STAGE 0: LOAD
+             */
             // first row of the slice of K / V owned by this tile in K/V block sikv
             uint16_t s_start_kv = sikv * s_block_size_kv + tiles_j_max * jj;
 
             // load K,V & column multicast - the latter is currently inefficient (serialized push)
             // each tile has size [Stile x D] (transposed for Kt)
             if (ii == 0) {
-                mg_idma_memcpy_2d(&idma_ctrl,
-                                  &eu_ctrl,
-                                  WAIT_MODE,
+                mg_idma_memcpy_2d(WAIT_MODE,
                                   0,
                                   l2_addr_kt + ((s_start_kv - tiles_j_max * jj) * 2),
                                   l1_addr_kt,
@@ -233,13 +206,11 @@ int main(void)
                                   reps_kt,
                                   &idma_evt_kt,
                                   NULL);
-                mg_idma_wait(&eu_ctrl, 0, WAIT_MODE, &idma_evt_kt);
+                mg_idma_wait(0, WAIT_MODE, &idma_evt_kt);
 
                 for (uint32_t mcast_kt = 0; mcast_kt < MESH_Y_TILES; mcast_kt++) {
                     if (mcast_kt != ii) {
-                        mg_idma_memcpy_1d(&idma_ctrl,
-                                          &eu_ctrl,
-                                          WAIT_MODE,
+                        mg_idma_memcpy_1d(WAIT_MODE,
                                           1,
                                           get_l1_base(GET_ID(mcast_kt, jj)) +
                                               (l1_addr_kt - l1_tile_base),
@@ -249,24 +220,20 @@ int main(void)
                                           NULL);
                     }
                 }
-                mg_idma_wait(&eu_ctrl, 1, WAIT_MODE, &idma_evt_kt);
+                mg_idma_wait(1, WAIT_MODE, &idma_evt_kt);
 
-                mg_idma_memcpy_1d(&idma_ctrl,
-                                  &eu_ctrl,
-                                  WAIT_MODE,
+                mg_idma_memcpy_1d(WAIT_MODE,
                                   0,
                                   l2_addr_v + ((s_start_kv - tiles_j_max * jj) * PROJ_SIZE * 2),
                                   l1_addr_v,
                                   len_v,
                                   &idma_evt_v,
                                   NULL);
-                mg_idma_wait(&eu_ctrl, 0, WAIT_MODE, &idma_evt_v);
+                mg_idma_wait(0, WAIT_MODE, &idma_evt_v);
 
                 for (uint32_t mcast_v = 0; mcast_v < MESH_Y_TILES; mcast_v++) {
                     if (mcast_v != ii) {
-                        mg_idma_memcpy_1d(&idma_ctrl,
-                                          &eu_ctrl,
-                                          WAIT_MODE,
+                        mg_idma_memcpy_1d(WAIT_MODE,
                                           1,
                                           get_l1_base(GET_ID(mcast_v, jj)) +
                                               (l1_addr_v - l1_tile_base),
@@ -276,22 +243,23 @@ int main(void)
                                           NULL);
                     }
                 }
-                mg_idma_wait(&eu_ctrl, 1, WAIT_MODE, &idma_evt_v);
+                mg_idma_wait(1, WAIT_MODE, &idma_evt_v);
             }
 
             // all sync
-            fsync_sync_global(&fsync_ctrl);
-            eu_fsync_wait(&eu_ctrl, WAIT_MODE);
+            fsync_sync_global();
+            eu_fsync_wait(WAIT_MODE);
 
+            /**
+             * STAGE 1: MATMUL Q @ Kt
+             */
             // tiles Q @ Kt -> attn [Stile x Stile]
             // FIXME: this memset is a workaround for the GVSOC model of RedMulE (and the MAGIA SDK)
             // not showing the feature to do pure matmuls with no accumulation (MATMUL vs GEMM
             // mode).
             l1_memset_zero_fp16(l1_addr_attn, tiles_i * tiles_j);
 
-            mg_redmule_gemm_enqueue(&redmule_ctrl,
-                                    &eu_ctrl,
-                                    WAIT_MODE,
+            mg_redmule_gemm_enqueue(WAIT_MODE,
                                     l1_addr_q,
                                     l1_addr_kt,
                                     l1_addr_attn,
@@ -300,9 +268,12 @@ int main(void)
                                     (uint16_t)tiles_j,
                                     &redmule_evt,
                                     NULL);
-            mg_redmule_gemm_commit_start(&redmule_ctrl);
-            mg_redmule_wait(&eu_ctrl, WAIT_MODE, &redmule_evt);
+            mg_redmule_gemm_commit_start();
+            mg_redmule_wait(WAIT_MODE, &redmule_evt);
 
+            /**
+             * STAGE 2: SOFTMAX
+             */
             // rescale attn [Stile x Stile] by 1/sqrt(P) in-place
             l1_scale_rsqrt_p_fp16_spatz(l1_addr_attn, l1_addr_attn, tiles_i * tiles_j);
 
@@ -318,9 +289,7 @@ int main(void)
 
             // gather all row maxima from tiles horizontally into the first column tiles
             if (jj > 0) {
-                mg_idma_memcpy_1d(&idma_ctrl,
-                                  &eu_ctrl,
-                                  WAIT_MODE,
+                mg_idma_memcpy_1d(WAIT_MODE,
                                   1,
                                   get_l1_base(GET_ID(ii, 0)) +
                                       (l1_addr_row_gather_buf + (jj * tiles_i * 2) - l1_tile_base),
@@ -328,10 +297,10 @@ int main(void)
                                   tiles_i * 2,
                                   &idma_evt_row_gather_buf,
                                   NULL);
-                mg_idma_wait(&eu_ctrl, 1, WAIT_MODE, &idma_evt_row_gather_buf);
+                mg_idma_wait(1, WAIT_MODE, &idma_evt_row_gather_buf);
             }
-            fsync_sync_row(&fsync_ctrl);
-            eu_fsync_wait(&eu_ctrl, WAIT_MODE);
+            fsync_sync_row();
+            eu_fsync_wait(WAIT_MODE);
 
             // row max over the whole S dimension:
             // row_max [Stile] = max over the rows of row_gather_buf [MESH_X_TILES x Stile],
@@ -342,9 +311,7 @@ int main(void)
 
                 for (uint32_t mcast_row_max = 0; mcast_row_max < MESH_X_TILES; mcast_row_max++) {
                     if (mcast_row_max != jj) {
-                        mg_idma_memcpy_1d(&idma_ctrl,
-                                          &eu_ctrl,
-                                          WAIT_MODE,
+                        mg_idma_memcpy_1d(WAIT_MODE,
                                           1,
                                           get_l1_base(GET_ID(ii, mcast_row_max)) +
                                               (l1_addr_row_max - l1_tile_base),
@@ -354,10 +321,10 @@ int main(void)
                                           NULL);
                     }
                 }
-                mg_idma_wait(&eu_ctrl, 1, WAIT_MODE, &idma_evt_row_max);
+                mg_idma_wait(1, WAIT_MODE, &idma_evt_row_max);
             }
-            fsync_sync_row(&fsync_ctrl);
-            eu_fsync_wait(&eu_ctrl, WAIT_MODE);
+            fsync_sync_row();
+            eu_fsync_wait(WAIT_MODE);
 
             // attn [Stile x Stile] = exp(attn - row_max [Stile]), in-place, with row_max broadcast
             // along the columns
@@ -379,9 +346,7 @@ int main(void)
             } else {
                 l1_rowsum_fp16_spatz(l1_addr_row_sum, l1_addr_attn, tiles_i, tiles_j);
 
-                mg_idma_memcpy_1d(&idma_ctrl,
-                                  &eu_ctrl,
-                                  WAIT_MODE,
+                mg_idma_memcpy_1d(WAIT_MODE,
                                   1,
                                   get_l1_base(GET_ID(ii, 0)) +
                                       (l1_addr_row_gather_buf + (jj * tiles_i * 2) - l1_tile_base),
@@ -389,10 +354,10 @@ int main(void)
                                   tiles_i * 2,
                                   &idma_evt_row_sum,
                                   NULL);
-                mg_idma_wait(&eu_ctrl, 1, WAIT_MODE, &idma_evt_row_sum);
+                mg_idma_wait(1, WAIT_MODE, &idma_evt_row_sum);
             }
-            fsync_sync_row(&fsync_ctrl);
-            eu_fsync_wait(&eu_ctrl, WAIT_MODE);
+            fsync_sync_row();
+            eu_fsync_wait(WAIT_MODE);
 
             // row sum over the whole S dimension:
             // row_sum [Stile] = sum over the rows of row_gather_buf [MESH_X_TILES x Stile],
@@ -413,9 +378,7 @@ int main(void)
 
                 for (uint32_t mcast_row_sum = 0; mcast_row_sum < MESH_X_TILES; mcast_row_sum++) {
                     if (mcast_row_sum != jj) {
-                        mg_idma_memcpy_1d(&idma_ctrl,
-                                          &eu_ctrl,
-                                          WAIT_MODE,
+                        mg_idma_memcpy_1d(WAIT_MODE,
                                           1,
                                           get_l1_base(GET_ID(ii, mcast_row_sum)) +
                                               (l1_addr_row_sum - l1_tile_base),
@@ -425,10 +388,10 @@ int main(void)
                                           NULL);
                     }
                 }
-                mg_idma_wait(&eu_ctrl, 1, WAIT_MODE, &idma_evt_row_sum);
+                mg_idma_wait(1, WAIT_MODE, &idma_evt_row_sum);
             }
-            fsync_sync_row(&fsync_ctrl);
-            eu_fsync_wait(&eu_ctrl, WAIT_MODE);
+            fsync_sync_row();
+            eu_fsync_wait(WAIT_MODE);
 
             // rescale the output accumulator of the previous blocks to the new max in-place
             if (sikv > 0) {
@@ -436,11 +399,12 @@ int main(void)
                     l1_addr_o, l1_addr_o, l1_addr_row_max_prev, tiles_i, PROJ_SIZE);
             }
 
+            /**
+             * STAGE 3: MATMUL Attn @ V
+             */
             // accumulate the block of the current sikv iteration into the output:
             // o [Stile x P] += attn [Stile x Stile] @ v [Stile x P]
-            mg_redmule_gemm_enqueue(&redmule_ctrl,
-                                    &eu_ctrl,
-                                    WAIT_MODE,
+            mg_redmule_gemm_enqueue(WAIT_MODE,
                                     l1_addr_attn,
                                     l1_addr_v,
                                     l1_addr_o,
@@ -449,8 +413,8 @@ int main(void)
                                     (uint16_t)PROJ_SIZE,
                                     &redmule_evt,
                                     NULL);
-            mg_redmule_gemm_commit_start(&redmule_ctrl);
-            mg_redmule_wait(&eu_ctrl, WAIT_MODE, &redmule_evt);
+            mg_redmule_gemm_commit_start();
+            mg_redmule_wait(WAIT_MODE, &redmule_evt);
 
             // keep the row max and row sum of the block of the current K/V iteration in
             // row_max_prev and row_sum_prev on every tile, for the online softmax rescaling in the
@@ -461,8 +425,8 @@ int main(void)
 
             // all the tiles of the column are done with kt and v before tile (0, jj) multicasts the
             // next K/V block
-            fsync_sync_col(&fsync_ctrl);
-            eu_fsync_wait(&eu_ctrl, WAIT_MODE);
+            fsync_sync_col();
+            eu_fsync_wait(WAIT_MODE);
         }
 
         // normalize the output accumulator by the row sum over the whole S dimension,
@@ -475,9 +439,7 @@ int main(void)
         for (int lvl = 0; lvl < MESH_X_TILES; lvl++) {
             if (stride < MESH_X_TILES) {
                 if ((jj % (2 * stride)) == stride) {
-                    mg_idma_memcpy_1d(&idma_ctrl,
-                                      &eu_ctrl,
-                                      WAIT_MODE,
+                    mg_idma_memcpy_1d(WAIT_MODE,
                                       1,
                                       get_l1_base(GET_ID(ii, jj - stride)) +
                                           (l1_addr_o_tree_recv_buf - l1_tile_base),
@@ -485,39 +447,37 @@ int main(void)
                                       tiles_i * PROJ_SIZE * 2,
                                       &idma_evt_o,
                                       NULL);
-                    mg_idma_wait(&eu_ctrl, 1, WAIT_MODE, &idma_evt_o);
+                    mg_idma_wait(1, WAIT_MODE, &idma_evt_o);
                 }
-                fsync_sync_row(&fsync_ctrl);
-                eu_fsync_wait(&eu_ctrl, WAIT_MODE);
+                fsync_sync_row();
+                eu_fsync_wait(WAIT_MODE);
 
                 if ((jj % (2 * stride)) == 0 && (jj + stride) < MESH_X_TILES) {
                     l1_add_fp16_spatz(
                         l1_addr_o, l1_addr_o, l1_addr_o_tree_recv_buf, tiles_i * PROJ_SIZE);
                 }
-                fsync_sync_row(&fsync_ctrl);
-                eu_fsync_wait(&eu_ctrl, WAIT_MODE);
+                fsync_sync_row();
+                eu_fsync_wait(WAIT_MODE);
                 stride = stride * 2;
             }
         }
 
         if (jj == 0) {
-            mg_idma_memcpy_1d(&idma_ctrl,
-                              &eu_ctrl,
-                              WAIT_MODE,
+            mg_idma_memcpy_1d(WAIT_MODE,
                               1,
                               l2_addr_o + ((s_start_q - tiles_i_max * ii) * PROJ_SIZE * 2),
                               l1_addr_o,
                               len_o,
                               &idma_evt_o,
                               NULL);
-            mg_idma_wait(&eu_ctrl, 1, WAIT_MODE, &idma_evt_o);
+            mg_idma_wait(1, WAIT_MODE, &idma_evt_o);
         }
     }
 
     // check the whole output on tile (0, 0), once every tile of the first column has written its
     // slices
-    fsync_sync_global(&fsync_ctrl);
-    eu_fsync_wait(&eu_ctrl, WAIT_MODE);
+    fsync_sync_global();
+    eu_fsync_wait(WAIT_MODE);
     uint32_t errors = 0;
 
     if (ii == 0) {

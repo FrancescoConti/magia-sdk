@@ -32,32 +32,12 @@ int main(void)
      */
     uint32_t hartid = get_hartid();
 
-    idma_config_t idma_cfg      = {.hartid = hartid};
-    idma_controller_t idma_ctrl = {
-        .base = NULL,
-        .cfg  = &idma_cfg,
-        .api  = &idma_api,
-    };
+    idma_init();
+    redmule_init();
 
-    redmule_config_t redmule_cfg      = {.hartid = hartid};
-    redmule_controller_t redmule_ctrl = {
-        .base = NULL,
-        .cfg  = &redmule_cfg,
-        .api  = &redmule_api,
-    };
-
-    idma_init(&idma_ctrl);
-    redmule_init(&redmule_ctrl);
-
-    eu_config_t eu_cfg      = {.hartid = hartid};
-    eu_controller_t eu_ctrl = {
-        .base = NULL,
-        .cfg  = &eu_cfg,
-        .api  = &eu_api,
-    };
-    eu_init(&eu_ctrl);
-    eu_redmule_init(&eu_ctrl, 0);
-    eu_idma_init(&eu_ctrl, 0);
+    eu_init();
+    eu_redmule_init(0);
+    eu_idma_init(0);
 
     uint32_t y_id         = GET_Y_ID(hartid);
     uint32_t x_id         = GET_X_ID(hartid);
@@ -121,23 +101,11 @@ int main(void)
     mg_event_t redmule_evt_0, redmule_evt_1;
     mg_event_t *redmule_evt_prev, *redmule_evt_curr;
 
-    mg_idma_memcpy_2d(&idma_ctrl,
-                      &eu_ctrl,
-                      WAIT_MODE,
-                      0,
-                      l2_addr_y,
-                      l1_addr_y,
-                      len_y,
-                      std_y,
-                      reps_y,
-                      &idma_evt_y,
-                      NULL);
-    mg_idma_wait(&eu_ctrl, 0, WAIT_MODE, &idma_evt_y);
+    mg_idma_memcpy_2d(WAIT_MODE, 0, l2_addr_y, l1_addr_y, len_y, std_y, reps_y, &idma_evt_y, NULL);
+    mg_idma_wait(0, WAIT_MODE, &idma_evt_y);
 
     // stage 0: load the operands of timeslot i
-    mg_idma_memcpy_2d(&idma_ctrl,
-                      &eu_ctrl,
-                      WAIT_MODE,
+    mg_idma_memcpy_2d(WAIT_MODE,
                       0,
                       l2_addr_x_raw,
                       l1_addr_x_raw_0,
@@ -147,21 +115,12 @@ int main(void)
                       &idma_evt_x_raw,
                       NULL);
 
-    mg_idma_memcpy_2d(&idma_ctrl,
-                      &eu_ctrl,
-                      WAIT_MODE,
-                      0,
-                      l2_addr_w,
-                      l1_addr_w_0,
-                      len_w,
-                      std_w,
-                      reps_w,
-                      &idma_evt_w,
-                      NULL);
+    mg_idma_memcpy_2d(
+        WAIT_MODE, 0, l2_addr_w, l1_addr_w_0, len_w, std_w, reps_w, &idma_evt_w, NULL);
 
     // end of the step: the loads of stage 0 overlapped the work above
-    mg_idma_wait(&eu_ctrl, 0, WAIT_MODE, &idma_evt_x_raw);
-    mg_idma_wait(&eu_ctrl, 0, WAIT_MODE, &idma_evt_w);
+    mg_idma_wait(0, WAIT_MODE, &idma_evt_x_raw);
+    mg_idma_wait(0, WAIT_MODE, &idma_evt_w);
 
     /**
      * pipeline: 3 stages; step i runs stage k on iteration i + 1 - k
@@ -202,9 +161,7 @@ int main(void)
 
         if (i < (timeslots - 1)) {
             // stage 0: load the operands of timeslot i
-            mg_idma_memcpy_2d(&idma_ctrl,
-                              &eu_ctrl,
-                              WAIT_MODE,
+            mg_idma_memcpy_2d(WAIT_MODE,
                               0,
                               l2_addr_x_raw + ((i + 1) * t_size * 2),
                               x_raw_pt_next,
@@ -214,9 +171,7 @@ int main(void)
                               &idma_evt_x_raw,
                               NULL);
 
-            mg_idma_memcpy_2d(&idma_ctrl,
-                              &eu_ctrl,
-                              WAIT_MODE,
+            mg_idma_memcpy_2d(WAIT_MODE,
                               0,
                               l2_addr_w + ((i + 1) * t_size * K_SIZE * 2),
                               w_pt_next,
@@ -229,9 +184,7 @@ int main(void)
 
         if (i < timeslots) {
             // stage 1: program the job while the core converts x, then start it
-            mg_redmule_gemm_enqueue(&redmule_ctrl,
-                                    &eu_ctrl,
-                                    WAIT_MODE,
+            mg_redmule_gemm_enqueue(WAIT_MODE,
                                     x_pt,
                                     w_pt,
                                     l1_addr_y,
@@ -242,33 +195,23 @@ int main(void)
                                     NULL);
 
             l1_copy_fp16(x_pt, x_raw_pt, tile_h * t_size);
-            mg_redmule_gemm_commit_start(&redmule_ctrl);
+            mg_redmule_gemm_commit_start();
         }
 
         if (i < (timeslots - 1)) {
             // end of the step: the loads of stage 0 overlapped the work above
-            mg_idma_wait(&eu_ctrl, 0, WAIT_MODE, &idma_evt_x_raw);
-            mg_idma_wait(&eu_ctrl, 0, WAIT_MODE, &idma_evt_w);
+            mg_idma_wait(0, WAIT_MODE, &idma_evt_x_raw);
+            mg_idma_wait(0, WAIT_MODE, &idma_evt_w);
         }
 
         if (i > 0) {
             // stage 2: the job of timeslot i ran behind the one of timeslot i + 1
-            mg_redmule_wait(&eu_ctrl, WAIT_MODE, redmule_evt_prev);
+            mg_redmule_wait(WAIT_MODE, redmule_evt_prev);
         }
     }
 
-    mg_idma_memcpy_2d(&idma_ctrl,
-                      &eu_ctrl,
-                      WAIT_MODE,
-                      1,
-                      l2_addr_y,
-                      l1_addr_y,
-                      len_y,
-                      std_y,
-                      reps_y,
-                      &idma_evt_y,
-                      NULL);
-    mg_idma_wait(&eu_ctrl, 1, WAIT_MODE, &idma_evt_y);
+    mg_idma_memcpy_2d(WAIT_MODE, 1, l2_addr_y, l1_addr_y, len_y, std_y, reps_y, &idma_evt_y, NULL);
+    mg_idma_wait(1, WAIT_MODE, &idma_evt_y);
     uint32_t errors = 0;
     uint16_t computed, expected, diff = 0;
     for (int i = (tile_h_max * y_id); i < (tile_h_max * y_id + tile_h); i++) {

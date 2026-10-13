@@ -32,41 +32,14 @@ int main(void)
      */
     uint32_t hartid = get_hartid();
 
-    idma_config_t idma_cfg      = {.hartid = hartid};
-    idma_controller_t idma_ctrl = {
-        .base = NULL,
-        .cfg  = &idma_cfg,
-        .api  = &idma_api,
-    };
+    fsync_init();
+    idma_init();
+    redmule_init();
 
-    redmule_config_t redmule_cfg      = {.hartid = hartid};
-    redmule_controller_t redmule_ctrl = {
-        .base = NULL,
-        .cfg  = &redmule_cfg,
-        .api  = &redmule_api,
-    };
-
-    fsync_config_t fsync_cfg      = {.hartid = hartid};
-    fsync_controller_t fsync_ctrl = {
-        .base = NULL,
-        .cfg  = &fsync_cfg,
-        .api  = &fsync_api,
-    };
-
-    fsync_init(&fsync_ctrl);
-    idma_init(&idma_ctrl);
-    redmule_init(&redmule_ctrl);
-
-    eu_config_t eu_cfg      = {.hartid = hartid};
-    eu_controller_t eu_ctrl = {
-        .base = NULL,
-        .cfg  = &eu_cfg,
-        .api  = &eu_api,
-    };
-    eu_init(&eu_ctrl);
-    eu_redmule_init(&eu_ctrl, 0);
-    eu_idma_init(&eu_ctrl, 0);
-    eu_fsync_init(&eu_ctrl, 0);
+    eu_init();
+    eu_redmule_init(0);
+    eu_idma_init(0);
+    eu_fsync_init(0);
 
     uint32_t y_id         = GET_Y_ID(hartid);
     uint32_t x_id         = GET_X_ID(hartid);
@@ -141,18 +114,9 @@ int main(void)
      * TEST LOOP - REPEAT THE TEST N_ITERATION TIMES.
      */
     for (int z = 0; z < N_ITERATIONS; z++) {
-        mg_idma_memcpy_2d(&idma_ctrl,
-                          &eu_ctrl,
-                          WAIT_MODE,
-                          0,
-                          l2_addr_x,
-                          l1_addr_x,
-                          len_x,
-                          std_x,
-                          reps_x,
-                          &idma_evt_x,
-                          NULL);
-        mg_idma_wait(&eu_ctrl, 0, WAIT_MODE, &idma_evt_x);
+        mg_idma_memcpy_2d(
+            WAIT_MODE, 0, l2_addr_x, l1_addr_x, len_x, std_x, reps_x, &idma_evt_x, NULL);
+        mg_idma_wait(0, WAIT_MODE, &idma_evt_x);
 
         /**
          * 3. Systolic pipeline over the output blocks: load the weight block (and, on the left
@@ -161,38 +125,20 @@ int main(void)
          */
         // stage 0: load the blocks of timeslot pt
         if (x_id == 0) {
-            mg_idma_memcpy_2d(&idma_ctrl,
-                              &eu_ctrl,
-                              WAIT_MODE,
-                              0,
-                              l2_addr_y,
-                              l1_addr_y_0,
-                              len_y,
-                              std_y,
-                              reps_y,
-                              &idma_evt_y_in,
-                              NULL);
+            mg_idma_memcpy_2d(
+                WAIT_MODE, 0, l2_addr_y, l1_addr_y_0, len_y, std_y, reps_y, &idma_evt_y_in, NULL);
         }
 
-        mg_idma_memcpy_2d(&idma_ctrl,
-                          &eu_ctrl,
-                          WAIT_MODE,
-                          0,
-                          l2_addr_w,
-                          l1_addr_w_0,
-                          len_w,
-                          std_w,
-                          reps_w,
-                          &idma_evt_w,
-                          NULL);
+        mg_idma_memcpy_2d(
+            WAIT_MODE, 0, l2_addr_w, l1_addr_w_0, len_w, std_w, reps_w, &idma_evt_w, NULL);
 
         // end of the step: wait for the transfers and the job issued above
         if (x_id == 0) {
-            mg_idma_wait(&eu_ctrl, 0, WAIT_MODE, &idma_evt_y_in);
+            mg_idma_wait(0, WAIT_MODE, &idma_evt_y_in);
         }
-        mg_idma_wait(&eu_ctrl, 0, WAIT_MODE, &idma_evt_w);
-        fsync_sync_row(&fsync_ctrl);
-        eu_fsync_wait(&eu_ctrl, WAIT_MODE);
+        mg_idma_wait(0, WAIT_MODE, &idma_evt_w);
+        fsync_sync_row();
+        eu_fsync_wait(WAIT_MODE);
 
         /**
          * systolic: 3 stages; step pt runs stage k on iteration pt + 1 - k
@@ -232,9 +178,7 @@ int main(void)
                 if (pt < (timeslots - 1)) {
                     // stage 0: load the blocks of timeslot pt
                     if (x_id == 0) {
-                        mg_idma_memcpy_2d(&idma_ctrl,
-                                          &eu_ctrl,
-                                          WAIT_MODE,
+                        mg_idma_memcpy_2d(WAIT_MODE,
                                           0,
                                           l2_addr_y + ((pt + 1) * t_size * 2),
                                           y_pt_next,
@@ -245,9 +189,7 @@ int main(void)
                                           NULL);
                     }
 
-                    mg_idma_memcpy_2d(&idma_ctrl,
-                                      &eu_ctrl,
-                                      WAIT_MODE,
+                    mg_idma_memcpy_2d(WAIT_MODE,
                                       0,
                                       l2_addr_w + ((pt + 1) * t_size * 2),
                                       w_pt_next,
@@ -261,9 +203,7 @@ int main(void)
                 if (pt > 0) {
                     // stage 2: pass the block of timeslot pt to the next tile (or store it)
                     if (x_id == (MESH_X_TILES - 1)) {
-                        mg_idma_memcpy_2d(&idma_ctrl,
-                                          &eu_ctrl,
-                                          WAIT_MODE,
+                        mg_idma_memcpy_2d(WAIT_MODE,
                                           1,
                                           l2_addr_y + ((pt - 1) * t_size * 2),
                                           y_pt_prev,
@@ -273,9 +213,7 @@ int main(void)
                                           &idma_evt_y_out,
                                           NULL);
                     } else {
-                        mg_idma_memcpy_1d(&idma_ctrl,
-                                          &eu_ctrl,
-                                          WAIT_MODE,
+                        mg_idma_memcpy_1d(WAIT_MODE,
                                           1,
                                           l1_base_e + (y_pt_prev - l1_tile_base),
                                           y_pt_prev,
@@ -287,9 +225,7 @@ int main(void)
 
                 if (pt < timeslots) {
                     // stage 1: accumulate the block of timeslot pt
-                    mg_redmule_gemm_enqueue(&redmule_ctrl,
-                                            &eu_ctrl,
-                                            WAIT_MODE,
+                    mg_redmule_gemm_enqueue(WAIT_MODE,
                                             l1_addr_x,
                                             w_pt,
                                             y_pt,
@@ -298,35 +234,35 @@ int main(void)
                                             (uint16_t)t_size,
                                             &redmule_evt,
                                             NULL);
-                    mg_redmule_gemm_commit_start(&redmule_ctrl);
+                    mg_redmule_gemm_commit_start();
                 }
 
                 if (pt < (timeslots - 1)) {
                     // end of the step: wait for the transfers and the job issued above
                     if (x_id == 0) {
-                        mg_idma_wait(&eu_ctrl, 0, WAIT_MODE, &idma_evt_y_in);
+                        mg_idma_wait(0, WAIT_MODE, &idma_evt_y_in);
                     }
-                    mg_idma_wait(&eu_ctrl, 0, WAIT_MODE, &idma_evt_w);
+                    mg_idma_wait(0, WAIT_MODE, &idma_evt_w);
                 }
 
                 if (pt > 0) {
-                    mg_idma_wait(&eu_ctrl, 1, WAIT_MODE, &idma_evt_y_out);
+                    mg_idma_wait(1, WAIT_MODE, &idma_evt_y_out);
                 }
 
                 if (pt < timeslots) {
-                    mg_redmule_wait(&eu_ctrl, WAIT_MODE, &redmule_evt);
+                    mg_redmule_wait(WAIT_MODE, &redmule_evt);
                 }
             }
-            fsync_sync_row(&fsync_ctrl);
-            eu_fsync_wait(&eu_ctrl, WAIT_MODE);
+            fsync_sync_row();
+            eu_fsync_wait(WAIT_MODE);
         }
     }
 
     /**
      * 4. Check results
      */
-    fsync_sync_row(&fsync_ctrl);
-    eu_fsync_wait(&eu_ctrl, WAIT_MODE);
+    fsync_sync_row();
+    eu_fsync_wait(WAIT_MODE);
     uint32_t errors = 0;
 
     if (x_id == (MESH_X_TILES - 1)) {
