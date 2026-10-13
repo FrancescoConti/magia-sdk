@@ -21,8 +21,8 @@ S_BLOCK_SIZE_Q  = define(64)
 S_BLOCK_SIZE_KV = define(64)
 
 # Implemented in src/kernels.c, synchronous on the tile's CV32 core.
-# memset_zero: y[:] = 0 on the CV32 core (32-bit stores).
-memset_zero = l1_kernel("l1_memset_zero_fp16", operands=("y:out",), params=("y.size",), executor=CORE)
+# memset_zero: y[:] = 0 on Spatz (vse16.v of a zeroed register).
+memset_zero = l1_kernel("l1_memset_zero_fp16_spatz", operands=("y:out",), params=("y.size",), executor=CORE)
 # copy: y[:] = x[:] on the CV32 core (32-bit loads/stores).
 copy = l1_kernel("l1_copy_fp16", operands=("y:out", "x:in"), params=("x.size",), executor=CORE)
 # spatz_scale_rsqrt_p: y[:] = x[:] * 1/sqrt(PROJ_SIZE) on Spatz (vfmul.vf, scalar broadcast).

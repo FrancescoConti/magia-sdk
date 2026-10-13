@@ -15,6 +15,7 @@
 #include "exp_fp16_spatz.h"
 #include "expminus_fp16_spatz.h"
 #include "max_fp16_spatz.h"
+#include "memset_fp16_spatz.h"
 #include "mul_broadcast_fp16_spatz.h"
 #include "mul_fp16_spatz.h"
 #include "reducemax_fp16_spatz.h"
@@ -26,7 +27,7 @@
 #include "mgc_flat_attn_naive_spatz_task_bin.h"
 
 /* Per-tile flag: Spatz is set up on each tile before its first task. */
-static volatile uint8_t spatz_ready[NUM_HARTS];
+static volatile uint8_t spatz_ready __attribute__((section(".tile_bss")));
 
 /**
  * Lazy Spatz setup on this tile (event unit line, binary and clock): the mgc-generated main
@@ -34,26 +35,20 @@ static volatile uint8_t spatz_ready[NUM_HARTS];
  */
 static void spatz_setup(void)
 {
-    uint32_t hid = get_hartid();
-
-    if (spatz_ready[hid])
+    if (spatz_ready)
         return;
     eu_spatz_init(0);
     spatz_init(SPATZ_BINARY_START);
-    spatz_ready[hid] = 1;
+    spatz_ready = 1;
 }
 
 /**
- * y[k] = 0 for `n` fp16 elements, on the CV32 core (32-bit stores, plus a
- * 16-bit one for an odd tail).
+ * y[k] = 0 for `n` fp16 elements, on this tile's Spatz.
  */
-void l1_memset_zero_fp16(uint32_t y, uint32_t n)
+void l1_memset_zero_fp16_spatz(uint32_t y, uint32_t n)
 {
-    volatile uint32_t *y32 = (volatile uint32_t *)y;
-    for (uint32_t k = 0; k < n / 2; k++)
-        y32[k] = 0;
-    if (n & 1)
-        ((volatile uint16_t *)y)[n - 1] = 0;
+    spatz_setup();
+    MAGIA_memset_zero_fp16_spatz_l1((float16 *)y, n);
 }
 
 /**

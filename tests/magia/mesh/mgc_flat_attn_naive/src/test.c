@@ -20,7 +20,7 @@
 #define S_BLOCK_SIZE_KV 64
 
 /** L1 kernel (CORE): all pointers are L1 addresses. */
-extern void l1_memset_zero_fp16(uint32_t y, uint32_t p0);
+extern void l1_memset_zero_fp16_spatz(uint32_t y, uint32_t p0);
 
 /** L1 kernel (CORE): all pointers are L1 addresses. */
 extern void l1_copy_fp16(uint32_t y, uint32_t x, uint32_t p0);
@@ -184,7 +184,7 @@ int main(void)
         }
 
         // reset the output accumulator o [Stile x P] for this Q block
-        l1_memset_zero_fp16(l1_addr_o, tiles_i * PROJ_SIZE);
+        l1_memset_zero_fp16_spatz(l1_addr_o, tiles_i * PROJ_SIZE);
 
         // sequential loop on tiled S dimension of K/V
         for (int sikv = 0; sikv < s_block_nb_kv; sikv++) {
@@ -257,7 +257,7 @@ int main(void)
             // FIXME: this memset is a workaround for the GVSOC model of RedMulE (and the MAGIA SDK)
             // not showing the feature to do pure matmuls with no accumulation (MATMUL vs GEMM
             // mode).
-            l1_memset_zero_fp16(l1_addr_attn, tiles_i * tiles_j);
+            l1_memset_zero_fp16_spatz(l1_addr_attn, tiles_i * tiles_j);
 
             mg_redmule_gemm_enqueue(WAIT_MODE,
                                     l1_addr_q,

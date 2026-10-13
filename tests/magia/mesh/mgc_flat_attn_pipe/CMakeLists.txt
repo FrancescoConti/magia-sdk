@@ -9,7 +9,7 @@
 set(TEST_NAME test_mgc_flat_attn_pipe)
 
 set(KERNELS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../../kernels)
-set(SPATZ_KERNELS add exp expminus max mul mul_broadcast reducemax reducesum rowdiv rowscale sub)
+set(SPATZ_KERNELS add exp expminus max memset mul mul_broadcast reducemax reducesum rowdiv rowscale sub)
 
 # All the Spatz kernels in one task binary -> mgc_flat_attn_pipe_spatz_task_bin.h
 set(SPATZ_TASK_SRCS)

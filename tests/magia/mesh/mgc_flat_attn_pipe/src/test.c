@@ -20,7 +20,7 @@
 #define S_BLOCK_SIZE_KV 64
 
 /** L1 kernel (CORE): all pointers are L1 addresses. */
-extern void l1_memset_zero_fp16(uint32_t y, uint32_t p0);
+extern void l1_memset_zero_fp16_spatz(uint32_t y, uint32_t p0);
 
 /** L1 kernel (CORE): all pointers are L1 addresses. */
 extern void l1_copy_fp16(uint32_t y, uint32_t x, uint32_t p0);
@@ -169,8 +169,8 @@ int main(void)
 
     mg_event_t idma_evt_q, idma_evt_kt_in, idma_evt_kt_out, idma_evt_v_in, idma_evt_v_out,
         idma_evt_o, idma_evt_row_max, idma_evt_row_sum, idma_evt_row_gather_buf;
-    mg_event_t redmule_evt_o;
     mg_event_t redmule_evt_attn;
+    mg_event_t redmule_evt_o;
 
     // sequential loop on tiled S dimension of Q
     for (int siq = 0; siq < s_block_nb_q; siq++) {
@@ -204,7 +204,7 @@ int main(void)
         }
 
         // reset the output accumulator o [Stile x P] for this Q block
-        l1_memset_zero_fp16(l1_addr_o, tiles_i * PROJ_SIZE);
+        l1_memset_zero_fp16_spatz(l1_addr_o, tiles_i * PROJ_SIZE);
 
         // sequential loop on tiled S dimension of K/V
         // stages are encoded out-of-order to enable correct overlap
@@ -372,6 +372,25 @@ int main(void)
                 }
             }
 
+            if (sikv < s_block_nb_kv) {
+                // tiles Q @ Kt -> attn [Stile x Stile]
+                // FIXME: this memset is a workaround for the GVSOC model of RedMulE (and the MAGIA
+                // SDK) not showing the feature to do pure matmuls with no accumulation (MATMUL vs
+                // GEMM mode).
+                l1_memset_zero_fp16_spatz(attn_pt, tiles_i * tiles_j);
+
+                mg_redmule_gemm_enqueue(WAIT_MODE,
+                                        l1_addr_q,
+                                        kt_pt,
+                                        attn_pt,
+                                        (uint16_t)tiles_i,
+                                        (uint16_t)PROJ_SIZE,
+                                        (uint16_t)tiles_j,
+                                        &redmule_evt_attn,
+                                        NULL);
+                mg_redmule_gemm_commit_start();
+            }
+
             if (sikv > 1) {
                 // rescale the output accumulator of the previous blocks to the new max in-place
                 if ((sikv - 2) > 0) {
@@ -388,25 +407,6 @@ int main(void)
                                         (uint16_t)tiles_j,
                                         (uint16_t)PROJ_SIZE,
                                         &redmule_evt_o,
-                                        NULL);
-                mg_redmule_gemm_commit_start();
-            }
-
-            if (sikv < s_block_nb_kv) {
-                // tiles Q @ Kt -> attn [Stile x Stile]
-                // FIXME: this memset is a workaround for the GVSOC model of RedMulE (and the MAGIA
-                // SDK) not showing the feature to do pure matmuls with no accumulation (MATMUL vs
-                // GEMM mode).
-                l1_memset_zero_fp16(attn_pt, tiles_i * tiles_j);
-
-                mg_redmule_gemm_enqueue(WAIT_MODE,
-                                        l1_addr_q,
-                                        kt_pt,
-                                        attn_pt,
-                                        (uint16_t)tiles_i,
-                                        (uint16_t)PROJ_SIZE,
-                                        (uint16_t)tiles_j,
-                                        &redmule_evt_attn,
                                         NULL);
                 mg_redmule_gemm_commit_start();
             }
