@@ -730,3 +730,56 @@ def main():
         body = self.SRC[self.SRC.index('        for i in pipeline'):]
         self.assertError('        idma.load(w, W[:, tile_w]).wait()\n',
                          '        idma.load(w, W[:, tile_w]).wait()\n' + body, 'only one pipeline() or systolic()')
+
+
+class JobEvents(unittest.TestCase):
+    """Jobs of different stages on the default event, in flight together in one step."""
+
+    SRC = '''from mgc import *
+
+M, N, K = sizes("M_SIZE", "N_SIZE", "K_SIZE")
+X = l2("x_inp", (M, N), fp16)
+W = l2("w_inp", (N, K), fp16)
+Y = l2("y_inp", (M, K), fp16)
+
+@test("test_job_events")
+def main():
+    for y_id, x_id in tiles():
+        tile_w = x_id.split(K)
+        steps: u8 = 4
+        t_size: u8 = M // steps
+        w = L1.single_buffer(W[:, tile_w])
+        x = L1.multi_buffer(X[0:t_size, :])
+        y = L1.multi_buffer(Y[0:t_size, tile_w])
+        z = L1.single_buffer(Y[0:t_size, tile_w])
+        idma.load(w, W[:, tile_w]).wait()
+        for i in pipeline(steps):
+            with stage(0):
+                idma.load(x[i], X[i * t_size:(i + 1) * t_size, :]).wait()
+            with stage(2):
+                jz = redmule.enqueue(x[i], w, z)
+                redmule.commit_start()
+            with stage(1):
+                jy = redmule.enqueue(x[i], w, y[i])
+                redmule.commit_start()
+            with stage(2):
+                jz.wait()
+            with stage(1):
+                jy.wait()
+'''
+
+    def test_overlapping_jobs_get_own_events(self):
+        c = _c(OS, 'x.mgc', self.SRC)
+        self.assertIn('mg_event_t redmule_evt_z;', c)
+        self.assertIn('mg_event_t redmule_evt_y;', c)
+        self.assertIn('mg_redmule_wait(&eu_ctrl, WAIT_MODE, &redmule_evt_z);', c)
+        self.assertNotIn('&redmule_evt)', c)
+
+    def test_disjoint_jobs_share_the_event(self):
+        src = self.SRC.replace('                redmule.commit_start()\n            with stage(1):',
+                               '                redmule.commit_start()\n                jz.wait()\n'
+                               '            with stage(1):', 1)
+        src = src.replace('            with stage(2):\n                jz.wait()\n', '')
+        c = _c(OS, 'x.mgc', src)
+        self.assertIn('mg_event_t redmule_evt;', c)
+        self.assertNotIn('redmule_evt_', c)

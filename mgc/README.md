@@ -291,6 +291,10 @@ iterations, so mgc gives it per-iteration storage: an event array indexed by `i`
 (`idma_evts_<buf>_in/_out`, `redmule_evts`), with the depth rule above. `mg_idma_wait` waits by
 transfer id, so several DMAs of the same direction may be pending.
 
+Jobs of different stages without `event=` can be in flight together in one step even if they
+are not in one iteration. mgc then gives each its own event, named after its output buffer
+(`redmule_evt_<buf>`, or `redmule_<buf>_evts` if waited in a later stage).
+
 Scalars declared in a block (`s_start: u16 = i * B`) can only be used in that block: elsewhere
 they would hold the value of another iteration. Recompute them where needed.
 

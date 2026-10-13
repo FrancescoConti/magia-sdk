@@ -94,7 +94,8 @@ def main():
             memset_zero(o)
 
             # sequential loop on tiled S dimension of K/V
-            for sikv in pipeline(s_block_nb_kv):
+            # stages are encoded out-of-order to enable correct overlap
+            for sikv in pipeline(s_block_nb_kv, sync=GLOBAL):
 
                 """
                 STAGE 0: LOAD
@@ -107,13 +108,23 @@ def main():
                     # load K,V & column multicast - the latter is currently inefficient (serialized push)
                     # each tile has size [Stile x D] (transposed for Kt)
                     if ii==0:
-                        idma.load(kt[sikv], kt_[:, s_start_kv:s_start_kv + tiles_j.size]).wait()
-                        idma.store(kt.col[sikv], kt[sikv]).wait()
-                        idma.load(v[sikv], v_[s_start_kv:s_start_kv + tiles_j.size, :]).wait()
-                        idma.store(v.col[sikv], v[sikv]).wait()
+                        ekt = idma.load(kt[sikv], kt_[:, s_start_kv:s_start_kv + tiles_j.size])
+                        ev = idma.load(v[sikv], v_[s_start_kv:s_start_kv + tiles_j.size, :])
 
-                    # all sync
-                    sync(GLOBAL)
+                """
+                STAGE 3: MATMUL Attn @ V
+                """
+
+                with stage(3):
+
+                    # rescale the output accumulator of the previous blocks to the new max in-place
+                    if sikv > 0:
+                        spatz_rowscale(o, o, row_max[sikv - 1])
+
+                    # accumulate the block of the current sikv iteration into the output:
+                    # o [Stile x P] += attn [Stile x Stile] @ v [Stile x P]
+                    jav = redmule.enqueue(attn[sikv], v[sikv], o)
+                    redmule.commit_start()
 
                 """
                 STAGE 1: MATMUL Q @ Kt
@@ -125,9 +136,8 @@ def main():
                     # FIXME: this memset is a workaround for the GVSOC model of RedMulE (and the MAGIA SDK) not showing
                     # the feature to do pure matmuls with no accumulation (MATMUL vs GEMM mode).
                     memset_zero(attn[sikv])
-                    j = redmule.enqueue(q, kt[sikv], attn[sikv])
+                    jqk = redmule.enqueue(q, kt[sikv], attn[sikv])
                     redmule.commit_start()
-                    j.wait()
 
                 """
                 STAGE 2: SOFTMAX
@@ -189,24 +199,23 @@ def main():
                         idma.store(row_sum.row[sikv], row_sum[sikv]).wait()
                     sync(ROW)
 
-                """
-                STAGE 3: MATMUL Attn @ V
-                """
+                with stage(0):
+                    if ii==0:
+                        ekt.wait()
+                        ekt_mc = idma.store(kt.col[sikv], kt[sikv])
+                        ev.wait()
+                        ev_mc = idma.store(v.col[sikv], v[sikv])
 
                 with stage(3):
+                    jav.wait()
 
-                    # rescale the output accumulator of the previous blocks to the new max in-place
-                    if sikv > 0:
-                        spatz_rowscale(o, o, row_max[sikv - 1])
+                with stage(1):
+                    jqk.wait()
 
-                    # accumulate the block of the current sikv iteration into the output:
-                    # o [Stile x P] += attn [Stile x Stile] @ v [Stile x P]
-                    j = redmule.enqueue(attn[sikv], v[sikv], o)
-                    redmule.commit_start()
-                    j.wait()
-
-                    # all the tiles of the column are done with kt and v before tile (0, jj) multicasts the next K/V block
-                    sync(COL)
+                with stage(0):
+                    if ii==0:
+                        ekt_mc.wait()
+                        ev_mc.wait()
 
             # normalize the output accumulator by the row sum over the whole S dimension,
             # o [Stile x P] = o / row_sum in-place where / is a row-wise division
