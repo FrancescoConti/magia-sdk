@@ -299,6 +299,7 @@ class Frontend:
         self.comments = _comments(src)
         self.cursor = 0
         self.hdefs, self.htext = parse_header(header)
+        self.lasts = set()  # (id of block, name): `<var>_last` scalars declared after the loops so far
         self.header = header
         self.env: Dict[str, object] = {
             'MESH_X_TILES': Sym('MESH_X_TILES'),
@@ -791,6 +792,8 @@ class Frontend:
     def alloc(self, s, name, kind):
         """`b = L1.single_buffer(X[r, c])` or `b = L1.multi_buffer(X[r, c], depth=3)`;
         without `depth=`, the multi-buffer gets the depth its pipeline() needs.
+        `pin="name"` or `pin=("a", "b")` pins the buffer to the named loop(s)
+        (`pipeline(n, name="a")`), so that buffers of different loops can share L1.
 
         The view argument only provides the buffer's shape (and transfer
         geometry); no data moves. Alternatively, `L1.single_buffer((d0, d1), fp16)`
@@ -815,18 +818,26 @@ class Frontend:
                 raise MgcError(s, f'L1.{kind}() takes an L2 tensor view or a shape tuple and a dtype')
             dtype = self.env[view.tensor].dtype
         depth = 1 if kind == 'single_buffer' else 0  # 0: inferred by pipeline()
+        pin = None
         for kw in s.value.keywords:
             if kw.arg == 'depth' and kind == 'multi_buffer':
                 depth = const_of(self.expr(kw.value))
                 if depth is None or depth < 2:
                     raise MgcError(s, 'L1.multi_buffer(..., depth=N) needs a constant N >= 2')
+            elif kw.arg == 'pin':
+                names = kw.value.elts if isinstance(kw.value, ast.Tuple) else [kw.value]
+                if not names or not all(isinstance(e, ast.Constant) and isinstance(e.value, str) for e in names):
+                    raise MgcError(s, 'pin= takes a loop name or a tuple of loop names (strings)')
+                pin = [e.value for e in names]
             else:
                 raise MgcError(s, f'unknown argument {kw.arg}')
         if not view.shape:
             raise MgcError(s, 'cannot allocate a scalar')
-        op = self.add(ir.AllocOp.create(attributes={'sym': StringAttr(name), 'view': ir.ViewAttr(view),
-                                                    'dtype': StringAttr(dtype), 'depth': IntAttr(depth)},
-                                        result_types=[ir.BufType()]), s)
+        attrs = {'sym': StringAttr(name), 'view': ir.ViewAttr(view), 'dtype': StringAttr(dtype),
+                 'depth': IntAttr(depth)}
+        if pin is not None:
+            attrs['pin'] = ArrayAttr([StringAttr(x) for x in pin])
+        op = self.add(ir.AllocOp.create(attributes=attrs, result_types=[ir.BufType()]), s)
         op.res.name_hint = name
         self.env[name] = Buf(name, op.res, view, depth)
 
@@ -1143,6 +1154,10 @@ class Frontend:
                     attrs['sync'] = StringAttr(sc)
                 elif kw.arg == 'time' and fn == 'systolic':
                     attrs['time'] = StringAttr(ast.literal_eval(kw.value))
+                elif kw.arg == 'name':
+                    if not (isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str)):
+                        raise MgcError(s, f'{fn}(n, name=...) takes a string')
+                    attrs['label'] = StringAttr(kw.value.value)
                 elif kw.arg == 'steps':
                     raise MgcError(s, f'{fn}(): `steps=` is computed by mgc from `skew` and `n`; remove it')
                 else:
@@ -1167,7 +1182,9 @@ class Frontend:
             else:
                 lname = f'{var}_last'
                 self.add(ir.ScalarOp.create(attributes={'sym': StringAttr(lname), 'ctype': StringAttr('int'),
-                                                        'value': ir.E(last), 'decl': IntAttr(1)}), s)
+                                                        'value': ir.E(last),
+                                                        'decl': IntAttr((id(self.blocks[-1]), lname) not in self.lasts)}), s)
+                self.lasts.add((id(self.blocks[-1]), lname))
                 last = Sym(lname, None, 'int')
             self.env['LAST'] = last
 

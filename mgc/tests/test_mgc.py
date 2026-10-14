@@ -830,10 +830,188 @@ def main():
         self.assertError('        idma.load(w, W[:, tile_w]).wait()\n',
                          '        with stage(0):\n            idma.load(w, W[:, tile_w]).wait()\n', 'go directly in the body')
 
-    def test_one_loop_per_test(self):
+    def loops(self, first=None, second=None):
+        """The test with its pipeline twice in a row; `first` / `second` edit the two bodies."""
         body = self.SRC[self.SRC.index('        for i in pipeline'):]
-        self.assertError('        idma.load(w, W[:, tile_w]).wait()\n',
-                         '        idma.load(w, W[:, tile_w]).wait()\n' + body, 'only one pipeline() or systolic()')
+        b1 = body if first is None else first(body)
+        b2 = body if second is None else second(body)
+        src = self.SRC.replace(body, b1 + b2)
+        return _c(OS, 'x.mgc', src)
+
+    @staticmethod
+    def starts(c, s):
+        return [k for k in range(len(c)) if c.startswith(s, k)]
+
+    def test_loops_in_sequence(self):
+        # same variable, buffers and event array: each loop selects its own slots
+        c = self.loops()
+        loops = self.starts(c, 'for (int i = 0; i < steps + 1; i++) {')
+        switches = self.starts(c, 'switch (i % 3) {')
+        self.assertEqual(len(loops), 2)
+        self.assertEqual(len(switches), 2)
+        self.assertTrue(loops[0] < switches[0] < loops[1] < switches[1])
+        self.assertEqual(c.count('mg_event_t ev_0, ev_1;'), 1)
+        self.assertEqual(c.count('volatile uint32_t y_pt;'), 1)
+
+    def test_inferred_depth_over_loops(self):
+        # y needs 2 slots in the first loop and 3 in the second: both use 3
+        def no_store(b):
+            return b[:b.index('            with stage(2):')]
+        self.SRC = self.SRC.replace('y = L1.multi_buffer(Y[0:t_size, tile_w], depth=3)',
+                                    'y = L1.multi_buffer(Y[0:t_size, tile_w])')
+        try:
+            c = self.loops(first=no_store)
+        finally:
+            del self.SRC
+        self.assertEqual(c.count('y   stages 0..1  depth 3'), 1)
+        self.assertEqual(c.count('y   stages 0..2  depth 3'), 1)
+        self.assertIn('uint32_t l1_addr_y_2', c)
+
+    def test_prologue_scalar_declared_once(self):
+        def scalar(b):
+            return b.replace('                ex = idma.load(x[i], X[i * t_size:(i + 1) * t_size, :])\n',
+                             '                r: u32 = i * t_size\n'
+                             '                ex = idma.load(x[i], X[r:r + t_size, :])\n')
+        c = self.loops(first=scalar, second=scalar)
+        self.assertEqual(c.count('\n    uint32_t r = '), 1)  # first prologue, in the tile body
+        self.assertEqual(c.count('\n    r = '), 1)  # second prologue
+
+    def test_range_loops_reuse_variable(self):
+        src = _read(OS, 'mm_os_explicit.mgc')
+        a = src.index('            ey = idma.load(y, Y[tile_h, tile_w])\n')
+        b = src.index('            idma.store(Y[tile_h, tile_w], y).wait()\n')
+        b = src.index('\n', b) + 1
+        c = _c(OS, 'x.mgc', src[:b] + src[a:b] + src[b:])
+        loops = self.starts(c, 'for (int i = 0; i < timeslots; i++) {')
+        selects = self.starts(c, 'if (i % 2) {')
+        self.assertEqual(len(loops), 2)
+        self.assertEqual(len(selects), 2)
+        self.assertTrue(loops[0] < selects[0] < loops[1] < selects[1])
+
+
+class Pins(unittest.TestCase):
+    """Buffers pinned to named loops (`pin=`) share L1 with the buffers of the other loops."""
+
+    SRC = '''from mgc import *
+
+M, N, K = sizes("M_SIZE", "N_SIZE", "K_SIZE")
+X = l2("x_inp", (M, N), fp16)
+W = l2("w_inp", (N, K), fp16)
+Y = l2("y_inp", (M, K), fp16)
+
+@test("test_pins")
+def main():
+    for y_id, x_id in tiles():
+        tile_w = x_id.split(K)
+        steps: u8 = 4
+        t_size: u8 = M // steps
+        w = L1.single_buffer(W[:, tile_w])
+        a = L1.multi_buffer(X[0:t_size, :], pin="one")
+        b = L1.multi_buffer(Y[0:t_size, tile_w], pin="two")
+        c = L1.multi_buffer(Y[0:t_size, tile_w], pin="three")
+        idma.load(w, W[:, tile_w]).wait()
+        for i in pipeline(steps, name="one"):
+            with stage(0):
+                ea = idma.load(a[i], X[i * t_size:(i + 1) * t_size, :])
+            with stage(1):
+                ea.wait()
+        for i in pipeline(steps, name="two"):
+            with stage(0):
+                eb = idma.load(b[i], Y[i * t_size:(i + 1) * t_size, tile_w])
+            with stage(1):
+                eb.wait()
+        for i in pipeline(steps, name="three"):
+            with stage(0):
+                ec = idma.load(c[i], Y[i * t_size:(i + 1) * t_size, tile_w])
+            with stage(1):
+                ec.wait()
+'''
+
+    def c(self, *pairs):
+        src = self.SRC
+        for old, new in pairs:
+            self.assertIn(old, src)
+            src = src.replace(old, new, 1)
+        return _c(OS, 'x.mgc', src)
+
+    def assertError(self, pairs, msg):
+        with self.assertRaises(MgcError) as cm:
+            self.c(*pairs)
+        self.assertIn(msg, str(cm.exception))
+
+    def test_loops_share_l1(self):
+        c = self.c()
+        for buf in ('a', 'b', 'c'):
+            self.assertIn(f'uint32_t l1_addr_{buf}_0 = l1_addr_w + (', c)
+            self.assertIn(f'uint32_t l1_addr_{buf}_1 = l1_addr_{buf}_0 + (', c)
+
+    def test_unpinned_layout_unchanged(self):
+        c = self.c(('pin="one"', 'depth=2'), ('pin="two"', 'depth=2'), ('pin="three"', 'depth=2'))
+        self.assertIn('uint32_t l1_addr_b_0 = l1_addr_a_1 + (', c)
+        self.assertIn('uint32_t l1_addr_c_0 = l1_addr_b_1 + (', c)
+
+    def test_pin_to_two_loops(self):
+        # b lives through loops one and two: above a, and c of loop three still shares with both
+        c = self.c(('pin="two"', 'pin=("one", "two")'))
+        self.assertIn('uint32_t l1_addr_b_0 = l1_addr_a_1 + (', c)
+        self.assertIn('uint32_t l1_addr_c_0 = l1_addr_w + (', c)
+
+    def test_largest_end_at_run_time(self):
+        # d overlaps a (loop one) and b (loop two), neither known to be above the other
+        c = self.c(('        idma.load(w, W[:, tile_w]).wait()\n',
+                    '        d = L1.single_buffer(Y[0:t_size, tile_w], pin=("one", "two"))\n'
+                    '        idma.load(w, W[:, tile_w]).wait()\n'),
+                   ('                ea.wait()\n', '                ea.wait()\n                idma.load(d, Y[0:t_size, tile_w]).wait()\n'))
+        self.assertIn('uint32_t l1_addr_d = (((l1_addr_a_1 + (', c)
+        self.assertIn(') > (l1_addr_b_1 + (', c)
+        self.assertIn('uint32_t l1_addr_c_0 = l1_addr_w + (', c)
+
+    def test_back_to_back(self):
+        self.assertError([('pin="two"', 'pin=("one", "three")')], 'not back-to-back')
+
+    def test_unknown_loop(self):
+        self.assertError([('pin="two"', 'pin="four"')], 'no pipeline() or systolic() has name="four"')
+
+    def test_duplicate_name(self):
+        self.assertError([('name="two"', 'name="one"')], 'two loops are named "one"')
+
+    def test_use_outside_stretch(self):
+        self.assertError([('                ec.wait()\n',
+                           '                ec.wait()\n        idma.load(a[0], X[0:t_size, :]).wait()\n')],
+                         '`a` is pinned to "one" but used (or waited) outside')
+
+    def test_between_loops(self):
+        # b (from loop two) used before the last use of a (up to loop one), between the two loops
+        self.assertError([('        for i in pipeline(steps, name="two"):\n',
+                           '        idma.load(b[0], Y[0:t_size, tile_w]).wait()\n'
+                           '        idma.load(a[0], X[0:t_size, :]).wait()\n'
+                           '        for i in pipeline(steps, name="two"):\n')], 'between loops "one" and "two"')
+
+    def test_wait_counts_as_use(self):
+        # the load of a, issued between the loops, is waited after the first use of b
+        self.assertError([('        for i in pipeline(steps, name="two"):\n',
+                           '        ex = idma.load(a[0], X[0:t_size, :])\n'
+                           '        idma.load(b[0], Y[0:t_size, tile_w]).wait()\n'
+                           '        ex.wait()\n'
+                           '        for i in pipeline(steps, name="two"):\n')], 'between loops "one" and "two"')
+
+    def test_not_accessed_by_other_tiles(self):
+        self.assertError([('                ea.wait()\n',
+                           '                ea.wait()\n                idma.store(a.at_rel(0, 1)[i], a[i]).wait()\n')],
+                         'cannot be accessed by other tiles')
+
+    def test_named_loop_in_tile_body(self):
+        self.assertError([('        for i in pipeline(steps, name="three"):\n',
+                           '        for z in range(2):\n          for i in pipeline(steps, name="three"):\n'),
+                          ('            with stage(0):\n                ec', '              with stage(0):\n                ec'),
+                          ('            with stage(1):\n                ec', '              with stage(1):\n                ec')],
+                         'go directly in the tiles() body')
+
+    def test_last_declared_once(self):
+        # three loops over `i` with a run-time trip count: `i_last` is declared by the first only
+        c = _c(OS, 'x.mgc', self.SRC.replace('pipeline(steps,', 'pipeline(tile_w.size,'))
+        self.assertEqual(c.count('int i_last = tile_w - 1;'), 1)
+        self.assertEqual(c.count('    i_last = tile_w - 1;'), 2)
 
 
 class JobEvents(unittest.TestCase):

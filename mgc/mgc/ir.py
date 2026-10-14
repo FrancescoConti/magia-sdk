@@ -292,6 +292,7 @@ class AllocOp(IRDLOperation):
     """L1 buffer with `depth` slots, shaped like `view` (which also fixes its
     transfer geometry; an L1-only buffer has a tensorless view and no L2 address).
     `depth` 0: a multi-buffer whose depth the pipeline pass infers.
+    `pin`: the loops it is pinned to (`pin=`), checked by pin-check into `pin_lo`..`pin_hi`.
     legalize-idma adds `xfer` (and `axi`), l1-layout adds `addrs`."""
     name = 'mg.alloc'
     sym = attr_def(StringAttr)
@@ -301,6 +302,9 @@ class AllocOp(IRDLOperation):
     xfer = opt_attr_def(XferAttr)
     axi = opt_attr_def(ExprAttr)
     addrs = opt_attr_def(ArrayAttr)
+    pin = opt_attr_def(ArrayAttr)  # names of the loops the buffer is pinned to
+    pin_lo = opt_attr_def(IntAttr)  # pin-check: first and last pinned loop, in program order
+    pin_hi = opt_attr_def(IntAttr)
     res = result_def(BufType)
 
 
@@ -371,6 +375,7 @@ class PipelineOp(_Region):
     skew = opt_attr_def(ExprAttr)
     sync = opt_attr_def(StringAttr)
     time = opt_attr_def(StringAttr)
+    label = opt_attr_def(StringAttr)  # `name=`, for buffers pinned to the loop
     body = region_def()
 
 
