@@ -114,13 +114,6 @@ def main():
                     jqk = redmule.enqueue(q, kt[sikv], attn[sikv], op=MATMUL)
                     redmule.commit_start()
 
-                with stage(0):
-                    s_start_v: u16 = sikv * s_block_size_kv + tiles_j.start
-                    if ii==0:
-                        ekt.wait()
-                        ekt_mc = idma.store(kt.col[sikv], kt[sikv])
-                        ev = idma.load(v[sikv], v_[s_start_v:s_start_v + tiles_j.size, :])
-
                 """
                 STAGE 3: MATMUL Attn @ V
                 """
@@ -130,6 +123,15 @@ def main():
                     # accumulate the block of the current sikv iteration into the output:
                     # o [Stile x P] += attn [Stile x Stile] @ v [Stile x P]
                     jav = redmule.enqueue(attn[sikv], v[sikv], o, op=GEMM)
+
+                with stage(0):
+                    s_start_v: u16 = sikv * s_block_size_kv + tiles_j.start
+                    if ii==0:
+                        ekt.wait()
+                        ekt_mc = idma.store(kt.col[sikv], kt[sikv])
+                        ev = idma.load(v[sikv], v_[s_start_v:s_start_v + tiles_j.size, :])
+
+                with stage(3):
 
                     # rescale the output accumulator of the previous blocks to the new max in-place
                     if sikv > 0:

@@ -375,6 +375,20 @@ int main(void)
                 mg_redmule_gemm_commit_start();
             }
 
+            if (sikv > 1) {
+                // accumulate the block of the current sikv iteration into the output:
+                // o [Stile x P] += attn [Stile x Stile] @ v [Stile x P]
+                mg_redmule_gemm_enqueue(WAIT_MODE,
+                                        attn_pt_prev2,
+                                        v_pt_prev2,
+                                        l1_addr_o,
+                                        (uint16_t)tiles_i,
+                                        (uint16_t)tiles_j,
+                                        (uint16_t)PROJ_SIZE,
+                                        &redmule_evt_o,
+                                        NULL);
+            }
+
             if (sikv < (s_block_nb_kv - 1)) {
                 uint16_t s_start_v = (sikv + 1) * s_block_size_kv + tiles_j_max * jj;
 
@@ -405,18 +419,6 @@ int main(void)
             }
 
             if (sikv > 1) {
-                // accumulate the block of the current sikv iteration into the output:
-                // o [Stile x P] += attn [Stile x Stile] @ v [Stile x P]
-                mg_redmule_gemm_enqueue(WAIT_MODE,
-                                        attn_pt_prev2,
-                                        v_pt_prev2,
-                                        l1_addr_o,
-                                        (uint16_t)tiles_i,
-                                        (uint16_t)tiles_j,
-                                        (uint16_t)PROJ_SIZE,
-                                        &redmule_evt_o,
-                                        NULL);
-
                 // rescale the output accumulator of the previous blocks to the new max in-place
                 if ((sikv - 2) > 0) {
                     l1_rowscale_fp16_spatz(l1_addr_o, l1_addr_o, row_max_pt, tiles_i, PROJ_SIZE);
