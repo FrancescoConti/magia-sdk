@@ -254,20 +254,15 @@ int main(void)
              * STAGE 1: MATMUL Q @ Kt
              */
             // tiles Q @ Kt -> attn [Stile x Stile]
-            // FIXME: this memset is a workaround for the GVSOC model of RedMulE (and the MAGIA SDK)
-            // not showing the feature to do pure matmuls with no accumulation (MATMUL vs GEMM
-            // mode).
-            l1_memset_zero_fp16_spatz(l1_addr_attn, tiles_i * tiles_j);
-
-            mg_redmule_gemm_enqueue(WAIT_MODE,
-                                    l1_addr_q,
-                                    l1_addr_kt,
-                                    l1_addr_attn,
-                                    (uint16_t)tiles_i,
-                                    (uint16_t)PROJ_SIZE,
-                                    (uint16_t)tiles_j,
-                                    &redmule_evt,
-                                    NULL);
+            mg_redmule_matmul_enqueue(WAIT_MODE,
+                                      l1_addr_q,
+                                      l1_addr_kt,
+                                      l1_addr_attn,
+                                      (uint16_t)tiles_i,
+                                      (uint16_t)PROJ_SIZE,
+                                      (uint16_t)tiles_j,
+                                      &redmule_evt,
+                                      NULL);
             mg_redmule_gemm_commit_start();
             mg_redmule_wait(WAIT_MODE, &redmule_evt);
 

@@ -121,10 +121,7 @@ def main():
                 """
 
                 # tiles Q @ Kt -> attn [Stile x Stile]
-                # FIXME: this memset is a workaround for the GVSOC model of RedMulE (and the MAGIA SDK) not showing
-                # the feature to do pure matmuls with no accumulation (MATMUL vs GEMM mode).
-                memset_zero(attn)
-                j = redmule.enqueue(q, kt, attn, op=GEMM)
+                j = redmule.enqueue(q, kt, attn, op=MATMUL)
                 redmule.commit_start()
                 j.wait()
 
