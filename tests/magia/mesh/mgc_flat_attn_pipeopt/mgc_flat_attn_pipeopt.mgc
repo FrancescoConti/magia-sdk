@@ -99,11 +99,10 @@ def main():
                     # first row of the slice of K / V owned by this tile in K/V block sikv
                     s_start_kv: u16 = sikv * s_block_size_kv + tiles_j.start
 
-                    # load K,V & column multicast - the latter is currently inefficient (serialized push)
-                    # each tile has size [Stile x D] (transposed for Kt)
+                    # load K, then V and the column multicasts (serialized push) in the next stage(0) blocks, so that
+                    # they overlap with RedMulE and Spatz; each tile has size [Stile x D] (transposed for Kt)
                     if ii==0:
                         ekt = idma.load(kt[sikv], kt_[:, s_start_kv:s_start_kv + tiles_j.size])
-                        ev = idma.load(v[sikv], v_[s_start_kv:s_start_kv + tiles_j.size, :])
 
                 """
                 STAGE 1: MATMUL Q @ Kt
@@ -117,6 +116,13 @@ def main():
                     memset_zero(attn[sikv])
                     jqk = redmule.enqueue(q, kt[sikv], attn[sikv])
                     redmule.commit_start()
+
+                with stage(0):
+                    s_start_v: u16 = sikv * s_block_size_kv + tiles_j.start
+                    if ii==0:
+                        ekt.wait()
+                        ekt_mc = idma.store(kt.col[sikv], kt[sikv])
+                        ev = idma.load(v[sikv], v_[s_start_v:s_start_v + tiles_j.size, :])
 
                 """
                 STAGE 3: MATMUL Attn @ V
@@ -132,6 +138,11 @@ def main():
                     # o [Stile x P] += attn [Stile x Stile] @ v [Stile x P]
                     jav = redmule.enqueue(attn[sikv], v[sikv], o)
                     redmule.commit_start()
+
+                with stage(0):
+                    if ii==0:
+                        ev.wait()
+                        ev_mc = idma.store(v.col[sikv], v[sikv])
 
                 """
                 STAGE 2: SOFTMAX
@@ -184,13 +195,6 @@ def main():
                             spatz_colsum_acc(row_sum[sikv], row_gather_buf)
                         idma.store(row_sum.row[sikv], row_sum[sikv]).wait()
                     sync(ROW)
-
-                with stage(0):
-                    if ii==0:
-                        ekt.wait()
-                        ekt_mc = idma.store(kt.col[sikv], kt[sikv])
-                        ev.wait()
-                        ev_mc = idma.store(v.col[sikv], v[sikv])
 
                 with stage(3):
                     jav.wait()
