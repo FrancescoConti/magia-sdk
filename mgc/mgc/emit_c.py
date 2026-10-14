@@ -486,6 +486,8 @@ class Emitter:
                 break  # declarations go before the first loop (e.g. not after a pipeline's `i_last`)
             if isinstance(op, DECLARATIVE) or (isinstance(op, ir.ScalarOp) and op.decl.data):
                 cut = k + 1
+            elif not isinstance(op, (ir.CommentOp, ir.ScalarOp)):
+                break  # nor after a statement that may use them (a pipeline prologue at the top)
         self.block(ops[:cut])
         decl_at = len(self.w.lines)
         self.block(ops[cut:])
