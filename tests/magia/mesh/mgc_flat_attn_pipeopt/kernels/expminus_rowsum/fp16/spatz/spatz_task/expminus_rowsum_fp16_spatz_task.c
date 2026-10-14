@@ -64,9 +64,9 @@ static inline _Float16 expminus_row(const _Float16 *src,
 /* expminus_row and rowsum on all rows, for aligned rows of at most VLMAX elements with vl
    set by the caller. The VU queues only 4 instructions, so the scalar work between rows (no
    peeling or strip loop here) must fit under the previous row's tail. The row sum reduces the
-   row just computed, in fp32 and in element order as rowsum (each half of the row widened, then
-   vfredusum): no column-strided loads, which hit a single L1 bank when the row pitch is a
-   multiple of 128 B. */
+   row just computed in fp32, with one vfredusum: the two halves of the row (elements c and
+   c + VLMAX/2) are first added while widened. No column-strided loads, which hit a single L1
+   bank when the row pitch is a multiple of 128 B. */
 static inline void expminus_rows_1strip(const _Float16 *X,
                                         _Float16 *Y,
                                         _Float16 *S,
@@ -93,15 +93,17 @@ static inline void expminus_rows_1strip(const _Float16 *X,
         asm volatile("vsetvli zero, %0, e32, m8, ta, ma" ::"r"(1));
         asm volatile("vfmv.s.f v24, %0" ::"f"(0.0f));
         asm volatile("vsetvli %0, %1, e16, m4, ta, ma" : "=r"(h) : "r"(cols));
-        asm volatile("vfwadd.vf v8, v0, %0" ::"f"(zero));
+        if (cols == 2 * h) {
+            asm volatile("vfwadd.vv v8, v0, v4");
+        } else {
+            asm volatile("vfwadd.vf v8, v0, %0" ::"f"(zero));
+            if (cols > h) {
+                asm volatile("vsetvli zero, %0, e16, m4, tu, ma" ::"r"(cols - h));
+                asm volatile("vfwadd.wv v8, v8, v4");
+            }
+        }
         asm volatile("vsetvli zero, %0, e32, m8, ta, ma" ::"r"(h));
         asm volatile("vfredusum.vs v24, v8, v24");
-        if (cols > h) {
-            asm volatile("vsetvli zero, %0, e16, m4, ta, ma" ::"r"(cols - h));
-            asm volatile("vfwadd.vf v8, v4, %0" ::"f"(zero));
-            asm volatile("vsetvli zero, %0, e32, m8, ta, ma" ::"r"(cols - h));
-            asm volatile("vfredusum.vs v24, v8, v24");
-        }
         asm volatile("vsetvli zero, %0, e16, m1, ta, ma" ::"r"(1));
         asm volatile("vfncvt.f.f.w v16, v24");
         asm volatile("vse16.v v16, (%0)" ::"r"(S + r) : "memory");
