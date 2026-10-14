@@ -8,24 +8,35 @@
 // mgc-generated test.c. All pointer arguments are L1 addresses.
 // The softmax uses the merged kernels in ../kernels instead of the generic ones.
 
-#include <stddef.h>
 #include <stdint.h>
 
 #include "test.h"
 #include "tile.h"
 #include "add_fp16_spatz.h"
-#include "colsum_rescale_fp16_spatz.h"
-#include "expminus_rowsum_fp16_spatz.h"
-#include "memset_fp16_spatz.h"
-#include "reducemax_fp16_spatz.h"
 #include "rowdiv_fp16_spatz.h"
-#include "rowmax_fp16_spatz.h"
-#include "rowscale_fp16_spatz.h"
+#include "colsum_rescale_fp16_spatz_params.h"
+#include "expminus_rowsum_fp16_spatz_params.h"
+#include "memset_fp16_spatz_params.h"
+#include "reducemax_fp16_spatz_params.h"
+#include "rowmax_fp16_spatz_params.h"
+#include "rowscale_fp16_spatz_params.h"
 #include "eventunit.h"
 #include "mgc_flat_attn_pipeopt_spatz_task_bin.h"
 
 /* Per-tile flag: Spatz is set up on each tile before its first task. */
 static volatile uint8_t spatz_ready __attribute__((section(".tile_bss")));
+
+/* Per-tile Spatz task parameters, one block per kernel of the K/V loop, preallocated in the
+   per-tile L1 so that each call only stores the pointers that change (fixed fields are set on
+   the first call, flagged by their non-zero size). */
+static struct {
+    memset_fp16_spatz_params_t memset;
+    rowscale_fp16_spatz_params_t rowscale;
+    rowmax_fp16_spatz_params_t rowmax;
+    reducemax_fp16_spatz_params_t colmax;
+    expminus_rowsum_fp16_spatz_params_t expminus_rowsum;
+    colsum_rescale_fp16_spatz_params_t colsum_rescale;
+} spatz_params __attribute__((section(".tile_bss")));
 
 /**
  * Lazy Spatz setup on this tile (event unit line, binary and clock): the mgc-generated main
@@ -40,13 +51,44 @@ static void spatz_setup(void)
     spatz_ready = 1;
 }
 
+/* Runs `task` on this tile's Spatz with the parameter block `params`, and waits for it. */
+static inline void spatz_offload(uint32_t task, void *params)
+{
+    spatz_setup();
+    /* The block stores must land before Spatz is triggered. */
+    asm volatile("" ::: "memory");
+    spatz_run_task_with_params(task, (uint32_t)params);
+    eu_wait_events(EU_SPATZ_DONE_MASK, WFE, 0);
+}
+
 /**
  * y[k] = 0 for `n` fp16 elements, on this tile's Spatz.
  */
 void l1_memset_zero_fp16_spatz(uint32_t y, uint32_t n)
 {
-    spatz_setup();
-    MAGIA_memset_zero_fp16_spatz_l1((float16 *)y, n);
+    memset_fp16_spatz_params_t *p = &spatz_params.memset;
+
+    p->shard_C = y;
+    p->len     = n;
+    spatz_offload(MEMSET_FP16_SPATZ_TASK, p);
+}
+
+/**
+ * y[r, c] = x[r, c] * s[r] for a `rows` x `cols` fp16 matrix, i.e. y = diag(s) x, on this
+ * tile's Spatz.
+ */
+void l1_rowscale_fp16_spatz(uint32_t y, uint32_t x, uint32_t s, uint32_t rows, uint32_t cols)
+{
+    rowscale_fp16_spatz_params_t *p = &spatz_params.rowscale;
+
+    if (!p->cols) {
+        p->shard_X = x;
+        p->shard_Y = y;
+        p->cols    = cols;
+        p->row_len = rows;
+    }
+    p->shard_S = s;
+    spatz_offload(ROWSCALE_FP16_SPATZ_TASK, p);
 }
 
 /**
@@ -54,17 +96,33 @@ void l1_memset_zero_fp16_spatz(uint32_t y, uint32_t n)
  */
 void l1_rowmax_fp16_spatz(uint32_t m, uint32_t x, uint32_t rows, uint32_t cols)
 {
-    spatz_setup();
-    MAGIA_rowmax_fp16_spatz_l1((const float16 *)x, NULL, (float16 *)m, rows, cols);
+    rowmax_fp16_spatz_params_t *p = &spatz_params.rowmax;
+
+    if (!p->cols) {
+        p->shard_M = m;
+        p->rows    = rows;
+        p->cols    = cols;
+    }
+    p->shard_X = x;
+    p->shard_P = 0;
+    spatz_offload(ROWMAX_FP16_SPATZ_TASK, p);
 }
 
 /**
  * m[r] = max(max_c x[r, c], p[r]) for a `rows` x `cols` fp16 matrix, on this tile's Spatz.
  */
-void l1_rowmax_max_fp16_spatz(uint32_t m, uint32_t x, uint32_t p, uint32_t rows, uint32_t cols)
+void l1_rowmax_max_fp16_spatz(uint32_t m, uint32_t x, uint32_t pm, uint32_t rows, uint32_t cols)
 {
-    spatz_setup();
-    MAGIA_rowmax_fp16_spatz_l1((const float16 *)x, (const float16 *)p, (float16 *)m, rows, cols);
+    rowmax_fp16_spatz_params_t *p = &spatz_params.rowmax;
+
+    if (!p->cols) {
+        p->shard_M = m;
+        p->rows    = rows;
+        p->cols    = cols;
+    }
+    p->shard_X = x;
+    p->shard_P = pm;
+    spatz_offload(ROWMAX_FP16_SPATZ_TASK, p);
 }
 
 /**
@@ -73,8 +131,28 @@ void l1_rowmax_max_fp16_spatz(uint32_t m, uint32_t x, uint32_t p, uint32_t rows,
  */
 void l1_colmax_fp16_spatz(uint32_t m, uint32_t x, uint32_t rows, uint32_t cols)
 {
-    spatz_setup();
-    MAGIA_reducemax_fp16_spatz_l1((const float16 *)x, (float16 *)m, 1, rows, cols);
+    reducemax_fp16_spatz_params_t *p = &spatz_params.colmax;
+
+    if (!p->reduce_dim) {
+        p->shard_X    = x;
+        p->reduce_dim = rows;
+        p->inner_dim  = cols;
+        p->outer_len  = 1;
+    }
+    p->shard_Y = m;
+    spatz_offload(REDUCEMAX_FP16_SPATZ_TASK, p);
+}
+
+/* Sets the fixed fields of the expminus_rowsum block, with the scale 1/sqrt(PROJ_SIZE). */
+static inline void expminus_rowsum_init(expminus_rowsum_fp16_spatz_params_t *p,
+                                        uint32_t rows,
+                                        uint32_t cols)
+{
+    float16 s = (float16)(1.0f / __builtin_sqrtf((float)PROJ_SIZE));
+
+    p->rows  = rows;
+    p->cols  = cols;
+    p->scale = ((union { float16 f; uint16_t u; }){.f = s}).u;
 }
 
 /**
@@ -84,15 +162,16 @@ void l1_colmax_fp16_spatz(uint32_t m, uint32_t x, uint32_t rows, uint32_t cols)
 void l1_expminus_rowsum_fp16_spatz(
     uint32_t y, uint32_t s, uint32_t x, uint32_t m, uint32_t rows, uint32_t cols)
 {
-    spatz_setup();
-    MAGIA_expminus_rowsum_fp16_spatz_l1((const float16 *)x,
-                                        (const float16 *)m,
-                                        (float16 *)y,
-                                        (float16 *)s,
-                                        NULL,
-                                        (float16)(1.0f / __builtin_sqrtf((float)PROJ_SIZE)),
-                                        rows,
-                                        cols);
+    expminus_rowsum_fp16_spatz_params_t *p = &spatz_params.expminus_rowsum;
+
+    if (!p->cols)
+        expminus_rowsum_init(p, rows, cols);
+    p->shard_X = x;
+    p->shard_M = m;
+    p->shard_Y = y;
+    p->shard_S = s;
+    p->shard_A = 0;
+    spatz_offload(EXPMINUS_ROWSUM_FP16_SPATZ_TASK, p);
 }
 
 /**
@@ -101,15 +180,16 @@ void l1_expminus_rowsum_fp16_spatz(
 void l1_expminus_rowsum_alpha_fp16_spatz(
     uint32_t y, uint32_t s, uint32_t a, uint32_t x, uint32_t m, uint32_t rows, uint32_t cols)
 {
-    spatz_setup();
-    MAGIA_expminus_rowsum_fp16_spatz_l1((const float16 *)x,
-                                        (const float16 *)m,
-                                        (float16 *)y,
-                                        (float16 *)s,
-                                        (float16 *)a,
-                                        (float16)(1.0f / __builtin_sqrtf((float)PROJ_SIZE)),
-                                        rows,
-                                        cols);
+    expminus_rowsum_fp16_spatz_params_t *p = &spatz_params.expminus_rowsum;
+
+    if (!p->cols)
+        expminus_rowsum_init(p, rows, cols);
+    p->shard_X = x;
+    p->shard_M = m;
+    p->shard_Y = y;
+    p->shard_S = s;
+    p->shard_A = a;
+    spatz_offload(EXPMINUS_ROWSUM_FP16_SPATZ_TASK, p);
 }
 
 /**
@@ -117,19 +197,36 @@ void l1_expminus_rowsum_alpha_fp16_spatz(
  */
 void l1_colsum_acc_fp16_spatz(uint32_t s, uint32_t g, uint32_t rows, uint32_t cols)
 {
-    spatz_setup();
-    MAGIA_colsum_rescale_fp16_spatz_l1((float16 *)s, (const float16 *)g, NULL, NULL, rows, cols);
+    colsum_rescale_fp16_spatz_params_t *p = &spatz_params.colsum_rescale;
+
+    if (!p->cols) {
+        p->shard_G = g;
+        p->rows    = rows;
+        p->cols    = cols;
+    }
+    p->shard_S = s;
+    p->shard_P = 0;
+    p->shard_A = 0;
+    spatz_offload(COLSUM_RESCALE_FP16_SPATZ_TASK, p);
 }
 
 /**
  * As l1_colsum_acc_fp16_spatz, then p[c] = a[c] * p[c] and s[c] = p[c] + s[c].
  */
 void l1_colsum_acc_rescale_fp16_spatz(
-    uint32_t s, uint32_t g, uint32_t p, uint32_t a, uint32_t rows, uint32_t cols)
+    uint32_t s, uint32_t g, uint32_t pp, uint32_t a, uint32_t rows, uint32_t cols)
 {
-    spatz_setup();
-    MAGIA_colsum_rescale_fp16_spatz_l1(
-        (float16 *)s, (const float16 *)g, (float16 *)p, (const float16 *)a, rows, cols);
+    colsum_rescale_fp16_spatz_params_t *p = &spatz_params.colsum_rescale;
+
+    if (!p->cols) {
+        p->shard_G = g;
+        p->rows    = rows;
+        p->cols    = cols;
+    }
+    p->shard_S = s;
+    p->shard_P = pp;
+    p->shard_A = a;
+    spatz_offload(COLSUM_RESCALE_FP16_SPATZ_TASK, p);
 }
 
 /**
@@ -139,16 +236,6 @@ void l1_add_fp16_spatz(uint32_t y, uint32_t a, uint32_t b, uint32_t n)
 {
     spatz_setup();
     MAGIA_add_fp16_spatz_l1((const float16 *)a, (const float16 *)b, (float16 *)y, n);
-}
-
-/**
- * y[r, c] = x[r, c] * s[r] for a `rows` x `cols` fp16 matrix, i.e. y = diag(s) x, on this
- * tile's Spatz.
- */
-void l1_rowscale_fp16_spatz(uint32_t y, uint32_t x, uint32_t s, uint32_t rows, uint32_t cols)
-{
-    spatz_setup();
-    MAGIA_rowscale_fp16_spatz_l1((const float16 *)x, (const float16 *)s, (float16 *)y, rows, cols);
 }
 
 /**
