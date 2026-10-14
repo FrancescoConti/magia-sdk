@@ -157,6 +157,7 @@ def main():
                     else:
                         spatz_rowmax(row_gather_buf, attn[sikv])
 
+                    # FIXME: this row reduction could be optimized better using flash-decoding
                     # gather all row maxima from tiles horizontally into the first column tiles
                     if jj > 0:
                         idma.store(row_gather_buf.at(ii, 0)[jj, :], row_gather_buf[0, :]).wait()

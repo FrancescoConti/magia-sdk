@@ -456,6 +456,7 @@ int main(void)
                     l1_rowmax_fp16_spatz(l1_addr_row_gather_buf, attn_pt_prev, tiles_i, tiles_j);
                 }
 
+                // FIXME: this row reduction could be optimized better using flash-decoding
                 // gather all row maxima from tiles horizontally into the first column tiles
                 if (jj > 0) {
                     mg_idma_memcpy_1d(
