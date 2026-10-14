@@ -48,7 +48,7 @@ def main():
                 ew = idma.load(w[i], W[i * t_size:(i + 1) * t_size, tile_w])
             # stage 1: program the job while the core converts x, then start it
             with stage(1):
-                redmule.enqueue(x[i], w[i], y, event=redmule_evt[i])
+                redmule.enqueue(x[i], w[i], y, op=GEMM, event=redmule_evt[i])
                 copy(x[i], x_raw[i])
                 redmule.commit_start()
             # end of the step: the loads of stage 0 overlapped the work above

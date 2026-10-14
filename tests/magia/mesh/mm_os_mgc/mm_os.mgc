@@ -87,7 +87,7 @@ def main():
                 with stage(0):
                     ex = idma.load(x[i], X[tile_h, i * t_size:(i + 1) * t_size])
                     ew = idma.load(w[i], W[i * t_size:(i + 1) * t_size, tile_w])
-                    redmule.enqueue(x[i], w[i], y, event=redmule_evt[i])
+                    redmule.enqueue(x[i], w[i], y, op=GEMM, event=redmule_evt[i])
                     ex.wait()
                     ew.wait()
                     redmule.commit_start()

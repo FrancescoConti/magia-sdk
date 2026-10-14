@@ -993,6 +993,25 @@ class Frontend:
         return ev or ir.EvtRef('hwpe', acc)
 
     @staticmethod
+    def _enqueue_op(c, acc, dev):
+        """Job of `acc.enqueue(...)`, from its `op=` argument (e.g. `op=GEMM`),
+        which is required when the jobs of the accelerator declare an `op`; and
+        the call without that argument."""
+        ops = {j.op: name for name, j in dev.jobs.items() if j.op}
+        if not ops:
+            return next(iter(dev.jobs)), c
+        names = ', '.join(f'op={o}' for o in ops)
+        kw = [k for k in c.keywords if k.arg == 'op']
+        if not kw:
+            raise MgcError(c, f'{acc}.enqueue needs the operation: {names}')
+        op = _name(kw[0].value)
+        if op not in ops:
+            raise MgcError(c, f'{acc}.enqueue: unknown operation `{ast.unparse(kw[0].value)}` ({names})')
+        rest = ast.copy_location(ast.Call(func=c.func, args=c.args,
+                                          keywords=[k for k in c.keywords if k.arg != 'op']), c)
+        return ops[op], rest
+
+    @staticmethod
     def _no_args(c):
         """Protocol steps and waits take no arguments (`lag=` was removed: the
         stage a statement runs in is the `with stage(k):` block holding it)."""
@@ -1005,9 +1024,11 @@ class Frontend:
     def hwpe(self, c, acc, fn, s):
         """Accelerator calls on `acc` (e.g. `redmule`):
 
-        - `redmule.gemm(x, w, y)` (a job named in `devices.HWPES`): one-shot job,
-          computes `y += x @ w`; returns its event;
-        - `redmule.enqueue(x, w, y, event=ev[k])`: program a job without starting it;
+        - `redmule.gemm(x, w, y)` / `redmule.matmul(x, w, z)` (jobs named in
+          `devices.HWPES`): one-shot job, computes `y += x @ w` / `z = x @ w`;
+          returns its event;
+        - `redmule.enqueue(x, w, y, op=GEMM, event=ev[k])`: program a job without
+          starting it; `op=` names the job (required if the jobs declare one);
         - `redmule.commit()` / `.start()` / `.commit_start()`: explicit queue control.
         """
         dev = devices.HWPES[acc]
@@ -1018,7 +1039,7 @@ class Frontend:
                                                   'action': StringAttr(fn), 'slots': ArrayAttr([])}), s)
             return None
         if fn == 'enqueue':
-            job = next(iter(dev.jobs))
+            job, c = self._enqueue_op(c, acc, dev)
             ev = self._event_kw(c, acc)
             bufs, slots = self._job_operands(c, s)
             self.add(ir.HwpeOp.create(operands=bufs, attributes={

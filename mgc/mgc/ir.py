@@ -414,6 +414,8 @@ class JobOp(IRDLOperation):
     event = opt_attr_def(EvtAttr)
     params = opt_attr_def(ArrayAttr)  # job-lower
     addrs = opt_attr_def(ArrayAttr)  # multi-buffer
+    alt = opt_attr_def(StringAttr)  # uninit-acc: job run instead when `alt_if` holds
+    alt_if = opt_attr_def(ExprAttr)  # uninit-acc
 
 
 @irdl_op_definition
@@ -429,6 +431,8 @@ class HwpeOp(IRDLOperation):
     event = opt_attr_def(EvtAttr)
     params = opt_attr_def(ArrayAttr)
     addrs = opt_attr_def(ArrayAttr)
+    alt = opt_attr_def(StringAttr)  # uninit-acc: job run instead when `alt_if` holds
+    alt_if = opt_attr_def(ExprAttr)  # uninit-acc
 
 
 @irdl_op_definition

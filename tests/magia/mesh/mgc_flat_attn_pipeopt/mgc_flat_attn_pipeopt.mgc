@@ -113,7 +113,7 @@ def main():
                     # tiles Q @ Kt -> attn [Stile x Stile]
                     # FIXME: this memset is a workaround for the GVSOC model of RedMulE (and the MAGIA SDK) not showing
                     # the feature to do pure matmuls with no accumulation (MATMUL vs GEMM mode).
-                    jqk = redmule.enqueue(q, kt[sikv], attn[sikv])
+                    jqk = redmule.enqueue(q, kt[sikv], attn[sikv], op=GEMM)
                     memset_zero(attn[sikv])
                     redmule.commit_start()
 
@@ -132,7 +132,7 @@ def main():
 
                     # accumulate the block of the current sikv iteration into the output:
                     # o [Stile x P] += attn [Stile x Stile] @ v [Stile x P]
-                    jav = redmule.enqueue(attn[sikv], v[sikv], o)
+                    jav = redmule.enqueue(attn[sikv], v[sikv], o, op=GEMM)
 
                     # rescale the output accumulator of the previous blocks to the new max in-place
                     if sikv > 0:

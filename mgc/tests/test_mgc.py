@@ -22,6 +22,7 @@ from mgc.errors import MgcError  # noqa: E402
 
 MESH = os.path.join(REPO, 'tests', 'magia', 'mesh')
 OS, WS, IS, L1K = (os.path.join(MESH, d) for d in ('mm_os_mgc', 'mm_ws_mgc', 'mm_is_mgc', 'mm_os_l1k'))
+MM = os.path.join(MESH, 'mm_matmul_mgc')
 
 
 def _read(d, name):
@@ -76,6 +77,9 @@ class Golden(unittest.TestCase):
 
     def test_mm_os_l1k(self):
         self.check(L1K, 'mm_os_l1k.mgc')
+
+    def test_mm_matmul(self):
+        self.check(MM, 'mm_matmul.mgc')
 
 
 class Equivalence(unittest.TestCase):
@@ -254,6 +258,106 @@ class Extensibility(unittest.TestCase):
             with self.assertRaises(MgcError) as cm:
                 _c(L1K, 'x.mgc', bad)
             self.assertIn('neureka.scale shapes do not match', str(cm.exception))
+
+
+class Matmul(unittest.TestCase):
+    """RedMulE MATMUL (`z = x @ w`): explicit, and chosen by uninit-acc for GEMMs
+    whose accumulator holds nothing yet."""
+
+    ONESHOT = '''from mgc import *
+
+M, N, K = sizes("M_SIZE", "N_SIZE", "K_SIZE")
+X = l2("x_inp", (M, N), fp16)
+W = l2("w_inp", (N, K), fp16)
+Y = l2("y_out", (M, K), fp16)
+
+@test("test_oneshot")
+def main():
+    for y_id, x_id in tiles():
+        tile_h = y_id.split(M)
+        tile_w = x_id.split(K)
+        x = L1.single_buffer(X[tile_h, :])
+        w = L1.single_buffer(W[:, tile_w])
+        y = L1.single_buffer(Y[tile_h, tile_w])
+        idma.load(x, X[tile_h, :]).wait()
+        idma.load(w, W[:, tile_w]).wait()
+        redmule.gemm(x, w, y).wait()
+        idma.store(Y[tile_h, tile_w], y).wait()
+'''
+
+    def mm(self, *pairs):
+        src = _read(MM, 'mm_matmul.mgc')
+        for old, new in pairs:
+            self.assertIn(old, src)
+            src = src.replace(old, new, 1)
+        return _c(MM, 'x.mgc', src)
+
+    def test_explicit_enqueue(self):
+        c = _c(OS, 'x.mgc', _read(OS, 'mm_os.mgc').replace('op=GEMM', 'op=MATMUL'))
+        self.assertIn('mg_redmule_matmul_enqueue(WAIT_MODE,', c)
+        self.assertNotIn('mg_redmule_gemm_enqueue', c)
+        self.assertIn('mg_redmule_gemm_commit_start();', c)  # the queue is shared
+
+    def test_explicit_oneshot(self):
+        c = _c(MM, 'x.mgc', self.ONESHOT.replace('redmule.gemm(', 'redmule.matmul('))
+        self.assertIn('mg_redmule_matmul(WAIT_MODE,', c)
+
+    def test_enqueue_needs_op(self):
+        with self.assertRaises(MgcError) as cm:
+            _c(OS, 'x.mgc', _read(OS, 'mm_os.mgc').replace(', op=GEMM', ''))
+        self.assertIn('redmule.enqueue needs the operation: op=GEMM, op=MATMUL', str(cm.exception))
+
+    def test_enqueue_unknown_op(self):
+        with self.assertRaises(MgcError) as cm:
+            _c(OS, 'x.mgc', _read(OS, 'mm_os.mgc').replace('op=GEMM', 'op=ADDMAX'))
+        self.assertIn('unknown operation `ADDMAX`', str(cm.exception))
+
+    def test_matmul_shapes(self):
+        with self.assertRaises(MgcError) as cm:
+            _c(MM, 'x.mgc', self.ONESHOT.replace('redmule.gemm(x, w, y)', 'redmule.matmul(w, x, y)'))
+        self.assertIn('redmule.matmul shapes do not match', str(cm.exception))
+
+    def test_uninit_oneshot(self):
+        # nothing writes y before the job: a MATMUL, always
+        c = _c(MM, 'x.mgc', self.ONESHOT)
+        self.assertIn('mg_redmule_matmul(WAIT_MODE,', c)
+        self.assertNotIn('mg_redmule_gemm(', c)
+
+    def test_init_oneshot(self):
+        c = _c(MM, 'x.mgc', self.ONESHOT.replace('        redmule.gemm(', '        idma.load(y, Y[tile_h, tile_w]).wait()\n'
+                                                                       '        redmule.gemm('))
+        self.assertIn('mg_redmule_gemm(WAIT_MODE,', c)
+        self.assertNotIn('matmul', c)
+
+    def test_uninit_pipeline(self):
+        # iteration 0 (pipeline prologue) is a MATMUL, the step loop accumulates
+        c = self.mm()
+        self.assertEqual(c.count('mg_redmule_matmul_enqueue('), 1)
+        self.assertEqual(c.count('mg_redmule_gemm_enqueue('), 1)
+        self.assertLess(c.index('mg_redmule_matmul_enqueue('), c.index('for (int i = 0;'))
+
+    def test_uninit_outer_loop(self):
+        # in a loop around the pipeline: only in its first iteration
+        c = _c(OS, 'x.mgc', _read(OS, 'mm_os.mgc').replace('            ey = idma.load(y, Y[tile_h, tile_w])\n', ''))
+        self.assertIn('if (z == 0) {\n            mg_redmule_matmul_enqueue(', c)
+        self.assertEqual(c.count('mg_redmule_matmul_enqueue('), 1)
+
+    def test_loaded_accumulator(self):
+        self.assertNotIn('matmul', _c(OS, 'mm_os.mgc'))
+
+    def test_write_before_wait(self):
+        # zeroing y after the enqueue but before the commit initializes it: the
+        # job runs from its start to its wait
+        c = self.mm(('WAIT_MODE = define(WFE)\n',
+                     'WAIT_MODE = define(WFE)\nzero = l1_kernel("zero_fp16", operands=("y:out",), '
+                     'params=("y.size",), executor=CORE)\n'),
+                    ('                ex.wait()\n', '                zero(y)\n                ex.wait()\n'))
+        self.assertNotIn('matmul', c)
+
+    def test_remote_write(self):
+        # partial sums written by the tile above: never switched
+        self.assertNotIn('matmul', _c(WS, 'mm_ws.mgc'))
+        self.assertNotIn('matmul', _c(IS, 'mm_is.mgc'))
 
 
 class Errors(unittest.TestCase):
@@ -560,7 +664,7 @@ def main():
             with stage(0):
                 ex = idma.load(x[i], X[i * t_size:(i + 1) * t_size, :])
                 ey = idma.load(y[i], Y[i * t_size:(i + 1) * t_size, tile_w])
-                redmule.enqueue(x[i], w, y[i], event=ev[i])
+                redmule.enqueue(x[i], w, y[i], op=GEMM, event=ev[i])
                 ex.wait()
                 ey.wait()
                 redmule.commit_start()
@@ -663,7 +767,7 @@ def main():
         self.assertIn('idma_evts_y_out  stages 2..3  depth 2', c)
 
     def test_cross_stage_default_job_event(self):
-        c = self.c(('redmule.enqueue(x[i], w, y[i], event=ev[i])', 'j = redmule.enqueue(x[i], w, y[i])'),
+        c = self.c(('redmule.enqueue(x[i], w, y[i], op=GEMM, event=ev[i])', 'j = redmule.enqueue(x[i], w, y[i], op=GEMM)'),
                    ('ev[i].wait()', 'j.wait()'))
         self.assertIn('mg_event_t redmule_evts_0, redmule_evts_1;', c)
         self.assertIn('mg_redmule_wait(WAIT_MODE, redmule_evts_curr);', c)
@@ -757,10 +861,10 @@ def main():
             with stage(0):
                 idma.load(x[i], X[i * t_size:(i + 1) * t_size, :]).wait()
             with stage(2):
-                jz = redmule.enqueue(x[i], w, z)
+                jz = redmule.enqueue(x[i], w, z, op=GEMM)
                 redmule.commit_start()
             with stage(1):
-                jy = redmule.enqueue(x[i], w, y[i])
+                jy = redmule.enqueue(x[i], w, y[i], op=GEMM)
                 redmule.commit_start()
             with stage(2):
                 jz.wait()

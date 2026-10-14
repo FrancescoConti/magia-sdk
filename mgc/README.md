@@ -48,6 +48,7 @@ or the compiler; the unit tests fail if they are out of date.
 | `tests/magia/mesh/mm_ws_mgc` | `mm_ws.mgc`, `mm_ws_explicit.mgc` | weight-static systolic GEMM, partial sums move down columns |
 | `tests/magia/mesh/mm_is_mgc` | `mm_is.mgc` | input-static systolic GEMM, partial sums move east along rows |
 | `tests/magia/mesh/mm_os_l1k` | `mm_os_l1k.mgc`, `src/kernels.c` | output-static GEMM with a CV32 kernel in the pipeline |
+| `tests/magia/mesh/mm_matmul_mgc` | `mm_matmul.mgc` | output-static MATMUL (no bias): the first job of each tile is made a MATMUL by `uninit-acc` |
 
 `*_explicit.mgc` files write the schedule by hand; the others use `pipeline()` or `systolic()`. The hand-written
 references are `mm_os_mglib`, `mm_ws_mglib` and `mm_is_mglib`; the last two are mglib ports of
@@ -80,7 +81,7 @@ for y_id, x_id in tiles():
                 else:
                     es = idma.store(y.at_rel(1, 0)[pt], y[pt])   # same slot, tile below
             with stage(1):                                # y += x @ w
-                j = redmule.enqueue(x[pt], w, y[pt])
+                j = redmule.enqueue(x[pt], w, y[pt], op=GEMM)
                 redmule.commit_start()
             with stage(0):                                # end of the step: wait for all of it
                 if y_id == 0:
@@ -185,9 +186,11 @@ waiting on an event that was never issued.
 | Statement | Emitted |
 |---|---|
 | `j = redmule.gemm(x, w, y)` then `j.wait()` | `mg_redmule_gemm` (y += x @ w), `mg_redmule_wait` |
+| `j = redmule.matmul(x, w, z)` then `j.wait()` | `mg_redmule_matmul` (z = x @ w, z is not read), `mg_redmule_wait` |
 | `ev = redmule.events(n)` | event array; index with `ev[c]` or `ev[v + k]`; `redmule.events()` inside a pipeline gets the size its stages need |
-| `redmule.enqueue(x, w, y, event=ev[k])` | `mg_redmule_gemm_enqueue` |
-| `redmule.commit()`, `start()`, `commit_start()` | `mg_redmule_gemm_commit`, `_start`, `_commit_start` |
+| `redmule.enqueue(x, w, y, op=GEMM, event=ev[k])` | `mg_redmule_gemm_enqueue`; `op=` is required |
+| `redmule.enqueue(x, w, z, op=MATMUL, event=ev[k])` | `mg_redmule_matmul_enqueue` |
+| `redmule.commit()`, `start()`, `commit_start()` | `mg_redmule_gemm_commit`, `_start`, `_commit_start` (GEMM and MATMUL jobs share the queue) |
 | `ev[k].wait()` | `mg_redmule_wait` |
 | `k(a, b, ...)` (an `l1_kernel`) | `c_fn(a, b, ..., params)`, a synchronous call on the CV32 core |
 | `sync(GLOBAL)`, `sync(ROW)`, `sync(COL)` | `fsync_sync_global/row/col` + `eu_fsync_wait` |
@@ -309,7 +312,7 @@ for i in pipeline(timeslots):
     with stage(0):
         ex = idma.load(x[i], X[...])
         ew = idma.load(w[i], W[...])
-        redmule.enqueue(x[i], w[i], y, event=ev[i])  # program the job while x, w load
+        redmule.enqueue(x[i], w[i], y, op=GEMM, event=ev[i])  # program the job while x, w load
         ex.wait()
         ew.wait()
         redmule.commit_start()                     # or commit() and start()
@@ -323,6 +326,19 @@ the iteration. It then simulates the schedule: the hardware queue commits and st
 enqueue order, so every `commit()`/`start()` must hit the job of its own iteration, and at most
 `queue_depth` jobs (2 for RedMulE) may be enqueued and not yet waited. Several jobs per
 accelerator are allowed.
+
+`op=` names the job and has no default: `op=GEMM` accumulates (`y += x @ w`), `op=MATMUL` does
+not (`z = x @ w`, without reading `z`), and so needs no initialized output.
+
+A GEMM (one-shot or `op=GEMM`) whose accumulator holds nothing yet is issued as a MATMUL by the
+`uninit-acc` pass: nothing would be accumulated, and the MATMUL does not read the accumulator. The
+accumulator holds something if a write of it (DMA load, job, L1 kernel, on any slot) comes before
+the job's `.wait()` in the iteration, e.g. a `memset_zero(y)` between the `enqueue` and the
+`commit_start`, or if the job is not in the first iteration of every loop around it. In an
+output-static pipeline that never loads `y`, the job of iteration 0 (in the prologue) becomes a
+MATMUL and the others accumulate onto it; inside a further loop, the prologue chooses between the
+two at run time (`if (z == 0)`). Buffers written by other tiles (`buf.at_rel(...)` stores) are
+never switched.
 
 #### `sync()` inside stages
 
@@ -392,7 +408,7 @@ pipelines. A fixed sequence of passes then lowers that intent to low-level detai
 and the last stage prints C against mglib. Each pass can be inspected on its own with `--print-ir-after`.
 
 ```
-.mgc → frontend → legalize-idma → pipeline → job-lower → multi-buffer → l1-layout → event-alloc → idma-mcast → emit-c → clang-format
+.mgc → frontend → legalize-idma → uninit-acc → pipeline → job-lower → multi-buffer → l1-layout → event-alloc → idma-mcast → emit-c → clang-format
 ```
 
 `mgc` also assists the MAGIA programmer by taking some decisions autonomously and rejecting some
@@ -480,8 +496,9 @@ IR conventions:
 | Pass | Job |
 |---|---|
 | `legalize-idma` | views → N-dimensional transfers, checked against `devices.IDMA`; base and per-transfer L2 addresses |
+| `uninit-acc` | GEMM jobs whose accumulator is not initialized → MATMUL (`if_uninit` in the descriptors), always or in the first iteration of their loops |
 | `pipeline` | `mg.pipeline` + `mg.stage` blocks → prologue and guarded step loop; depth inference/checks, per-iteration events, HWPE queue simulation |
-| `job-lower` | `mg.job` → RedMulE one-shot or CV32 call; parameters and shape checks from the descriptors |
+| `job-lower` | `mg.job` → RedMulE one-shot or CV32 call; parameters and shape checks from the descriptors; folds the `uninit-acc` conditions |
 | `multi-buffer` | slot indices → static addresses or rotating pointers with an `if`/`switch` selection |
 | `l1-layout` | identical L1 layout on all tiles; uses `*_max` tile sizes when buffers are accessed remotely; neighbour L1 bases |
 | `event-alloc` | event variable names; dataflow check of issue/wait |
@@ -540,7 +557,7 @@ Extending:
 ## Limitations
 
 - One `tiles()` loop and one `pipeline()` or `systolic()` per test; `cores()` left for future implementation to enable support for PULP cluster parallelism.
-- fp16 only; RedMulE GEMM is the only HWPE accelerator described.
+- fp16 only; RedMulE (GEMM and MATMUL) is the only HWPE accelerator described.
 - L1 kernels run only on the CV32 control core.
 - No L1 capacity check (tile sizes are run-time values).
 - The event check accepts code that is valid on at least one path, so it can miss errors that

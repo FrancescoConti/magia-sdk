@@ -78,7 +78,7 @@ def main():
             ex = idma.load(x[0], X[tile_h, 0:t_size])
             ew = idma.load(w[0], W[0:t_size, tile_w])
             # program the first job while its operands are loaded, start it once they have landed
-            redmule.enqueue(x[0], w[0], y, event=redmule_evt[0])
+            redmule.enqueue(x[0], w[0], y, op=GEMM, event=redmule_evt[0])
             ex.wait()
             ew.wait()
             ey.wait()
@@ -98,7 +98,7 @@ def main():
                     # prefetch the operands of the next iteration and program its job meanwhile
                     ex = idma.load(x[i + 1], X[tile_h, (i + 1) * t_size:(i + 2) * t_size])
                     ew = idma.load(w[i + 1], W[(i + 1) * t_size:(i + 2) * t_size, tile_w])
-                    redmule.enqueue(x[i + 1], w[i + 1], y, event=redmule_evt[i + 1])
+                    redmule.enqueue(x[i + 1], w[i + 1], y, op=GEMM, event=redmule_evt[i + 1])
                     # commit & start the next job once its operands have landed: it runs
                     # behind the current one
                     ex.wait()

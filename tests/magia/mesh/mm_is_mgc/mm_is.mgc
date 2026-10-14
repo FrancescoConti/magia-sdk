@@ -74,7 +74,7 @@ def main():
                         es = idma.store(y.at_rel(0, 1)[pt], y[pt])
                 # stage 1: accumulate the block of timeslot pt
                 with stage(1):
-                    j = redmule.enqueue(x, w[pt], y[pt])
+                    j = redmule.enqueue(x, w[pt], y[pt], op=GEMM)
                     redmule.commit_start()
                 # end of the step: wait for the transfers and the job issued above
                 with stage(0):
