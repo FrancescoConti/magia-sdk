@@ -94,6 +94,24 @@ It is then possible to wait for a specific software event by passing the corresp
 
 Supported WAIT_MODEs are WFE and POLLING.
 
+## MATMUL (no accumulation)
+
+GEMM jobs compute `y = x @ w + y`, so `y` must hold the bias (or zeroes) beforehand. To overwrite `y`
+instead, `y = x @ w`, use the MATMUL calls, which take the same arguments:
+
+```
+mg_redmule_matmul(WAIT_MODE, x, w, y, M_SIZE, N_SIZE, K_SIZE, &redmule_evt, callback);
+mg_redmule_matmul_enqueue(WAIT_MODE, x, w, y, M_SIZE, N_SIZE, K_SIZE, &redmule_evt, callback);
+```
+
+The previous content of `y` is never read, so it needs no initialization. MATMUL and GEMM jobs share
+the hardware queue: they are committed, started and waited with the same `mg_redmule_gemm_commit*`,
+`mg_redmule_gemm_start` and `mg_redmule_wait` calls, and can be freely mixed. The MATMUL calls are
+only available with the memory-mapped RedMulE registers (`REDMULE_MM=1`).
+
+As for GEMM, RedMulE stores the output in whole blocks of 8 rows: with `M` not a multiple of 8, the
+rows up to the next multiple of 8 past the end of `y` are overwritten with zeroes.
+
 # IDMA Programming model
 
 Unlike RedMule, the IDMA doesn't support in hardware enqueueing multiple transfers on the same channel. Therefore, a workaround SW-based 1-depth queue has been implemented.
