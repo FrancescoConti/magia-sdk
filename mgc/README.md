@@ -49,6 +49,7 @@ or the compiler; the unit tests fail if they are out of date.
 | `tests/magia/mesh/mm_is_mgc` | `mm_is.mgc` | input-static systolic GEMM, partial sums move east along rows |
 | `tests/magia/mesh/mm_os_l1k` | `mm_os_l1k.mgc`, `src/kernels.c` | output-static GEMM with a CV32 kernel in the pipeline |
 | `tests/magia/mesh/mm_matmul_mgc` | `mm_matmul.mgc` | output-static MATMUL (no bias): the first job of each tile is made a MATMUL by `uninit-acc` |
+| `tests/magia/mesh/mgc_unfused_attn` | `mgc_unfused_attn.mgc`, `src/kernels.c` | unfused attention: three named pipelines in a row (Q @ Kt on RedMulE, row softmax on Spatz, attn @ V on RedMulE), each step's buffers pinned to its loop so that the steps share L1 |
 
 `*_explicit.mgc` files write the schedule by hand; the others use `pipeline()` or `systolic()`. The hand-written
 references are `mm_os_mglib`, `mm_ws_mglib` and `mm_is_mglib`; the last two are mglib ports of
@@ -148,7 +149,7 @@ tile split, or an integer expression (which removes the dimension).
 | `b = L1.single_buffer(view)` | dense L1 buffer with the view's shape; the view also fixes the transfer geometry |
 | `b = L1.single_buffer((d0, d1, ...), dtype)` | L1-only buffer: each `d` is a tile split (its per-tile size) or an integer expression, e.g. `L1.single_buffer((tile_h, tile_w), fp16)`. No L2 tensor is involved; transfers to/from L2 must be dense. `L1.multi_buffer((d0, ...), dtype, depth=N)` works the same way |
 | `b = L1.multi_buffer(view, depth=N)` | `N` L1 buffers (*slots*, `N` ≥ 2 and constant), each shaped like `view`, used for double/triple buffering: e.g. load the next tile into one slot while an accelerator reads the current one. `b` itself is not an operand; it must be indexed to pick a slot. `b[c]` with a constant `c` (e.g. `b[0]`) is always the same, fixed slot. `b[v + k]`, where `v` is a loop variable and `k` a constant offset, is a *rotating* slot: the slot used changes with `v` (it is slot `(v + k) % N`), so `b[i]` and `b[i + 1]` mean "current" and "next" in iteration `i`. Without `depth=`, a buffer used in a `pipeline()`/`systolic()` gets the depth its stages need (see [Depths](#depths)). |
-| `b = L1.single_buffer(view, pin="qk")`, `pin=("qk", "sm")` | Either kind of buffer, *pinned* to the named loop(s) (`pipeline(n, name="qk")`): it shares L1 with the buffers of the other loops instead of having its own range for the whole test (see [Several loops](#several-loops)). |
+| `b = L1.single_buffer(view, pin="qk")`, `pin=("qk", "softmax")` | Either kind of buffer, *pinned* to the named loop(s) (`pipeline(n, name="qk")`): it shares L1 with the buffers of the other loops instead of having its own range for the whole test (see [Pinning buffers to loops](#pinning-buffers-to-loops)). |
 | `b.at_rel(dy, dx)[k]` | The copy of buffer `b` that lives in the L1 of a **neighbour tile**, i.e. the tile at `(y_id + dy, x_id + dx)`; `dy` and `dx` must be constants (e.g. `b.at_rel(0, 1)` is the tile to the right, `b.at_rel(1, 0)` the one below). Every tile allocates `b` at the same L1 offset, so the neighbour's copy is found at the neighbour's L1 base plus the local offset. `[k]` picks a slot as for a local multi-buffer (omit it if `b` has a single slot). It can only be used as the destination of `idma.store`, to push a local buffer to a neighbour: `idma.store(b.at_rel(0, 1)[k], b[k])` copies local slot `k` of `b` into the same slot of `b` on the tile to the right. Source and destination must be the same buffer and the same slot. |
 | `b.at(y, x)[k]` | As `b.at_rel`, but on the tile with **absolute** coordinates `(y, x)`, which can be any integer expressions, including run-time ones (e.g. `b.at(y_id, 0)`, the first tile of this row). The tile's L1 base is computed where the transfer is issued (`get_l1_base(GET_ID(y, x))`). |
 | `b.at(y, x)[i, j, ...]` | A **block** of single-slot buffer `b` on another tile (works with `at_rel`, `at`, `row`, `col`). Indices are as for L2 views (slices, or integers that drop the dimension), over `b`'s shape; there must be more than one index or a slice, otherwise it is a slot. Only the destination of `idma.store`, whose source can then be **any** local buffer or slot of the same shape and dtype: `idma.store(rs.at(y_id, 0)[x_id, :], r)` gathers `r` into row `x_id` of `rs` on the first tile of the row. The block's offset is computed with this tile's sizes, so tile splits in `b`'s shape must be the same on the receiving tile (e.g. a split along the axis shared by the two tiles). |
@@ -207,7 +208,7 @@ shapes: `name.shape[i]`, `name.size` (elements) or `name.bytes`. The C function 
 operand addresses, then the parameters, all as `uint32_t`, and must be provided by the test
 (e.g. `src/kernels.c`).
 
-### `pipeline(n, sync=None)`
+### `pipeline(n, sync=None, name=None)`
 
 `for i in pipeline(n):` is a software pipeline over `n` iterations. Its body describes **one
 iteration `i`**, split into **stages** with `with stage(k):` blocks. Stage `k` of iteration `i`
@@ -231,7 +232,7 @@ for sikv in pipeline(n_kv):
 |---|---|
 | `n` | number of iterations of the body (`i = 0 … n-1`), i.e. the trip count of the loop as written |
 | `sync=SCOPE` | `GLOBAL`, `ROW` or `COL`: a barrier after the prologue and at the end of every step |
-| `name="qk"` | names the loop, for the buffers pinned to it (`pin=`); also on `systolic()` |
+| `name="qk"` | names the loop, for the buffers pinned to it (see [Pinning buffers to loops](#pinning-buffers-to-loops)) |
 
 A stage block holds anything the tile body accepts: transfers and their `.wait()`, jobs and the
 HWPE protocol, L1 kernels, `if` (also on `i`), `for v in range(...)`, scalars and `sync()`. Its
@@ -268,31 +269,53 @@ error before any.
 
 #### Several loops
 
-A test may hold several `pipeline()` / `systolic()` loops, e.g. one per phase of a computation, and
-loops (also `range()` ones) may reuse a variable name: each loop gets its own slot selection.
-Buffers and event arrays may be shared by the loops; a depth left to the compiler is the largest
-any of them needs. A stage-0 scalar declared by the prologues of two loops in the same block is
-declared by the first and assigned by the second.
+A test may hold several `pipeline()` / `systolic()` loops, e.g. one per step of a computation,
+one after the other. Loops (also `range()` ones) may reuse a variable name: each loop gets its
+own slot selection, and `<var>_last` (see `LAST`) is declared once per block. Buffers and event
+arrays may be used by several loops; a depth left to the compiler is the largest any of them
+needs. A stage-0 scalar declared by the prologues of two loops in the same block is declared
+by the first and assigned by the second.
 
-By default every L1 buffer has its own range for the whole test, so the L1 used is the sum of
-all the buffers. A buffer **pinned** to a loop (`pin="qk"`, the loop declared with
-`name="qk"`) shares L1 with the buffers pinned to the other loops: the L1 used becomes the
-unpinned buffers plus the largest loop. Named loops go directly in the `tiles()` body, where
-they split it into stretches: the stretch of a loop runs from the end of the previous named
-loop to the start of the next one, so the statements between two loops belong to both.
-`pin-check` makes sure that a pinned buffer
+#### Pinning buffers to loops
 
-- is used only in the stretch of its loop (a transfer or job uses its buffers until its
-  `.wait()`);
-- between two loops, is used before any buffer of the next loop;
+By default every L1 buffer has its own address range for the whole test, so the L1 used is the
+sum of all the buffers, even of loops that never run at the same time. A buffer **pinned** to a
+loop shares L1 with the buffers pinned to the other loops: the L1 used becomes the unpinned
+buffers plus the largest loop. Name the loop with `name=` and pin the buffer with `pin=`
+(from `tests/magia/mesh/mgc_unfused_attn`):
+
+```python
+a  = L1.single_buffer(attn_[tile_h, tile_w], pin="qk")     # step 1 only
+sm = L1.multi_buffer(attn_[0:SM_CHUNK, :], pin="softmax")  # step 2 only: same L1 as `a`
+...
+for i in pipeline(QK_TIMESLOTS, name="qk"):
+    ...
+idma.store(attn_[tile_h, tile_w], a).wait()              # after the loop: still "qk"
+sync(GLOBAL)
+for c in pipeline(sm_rows // SM_CHUNK, name="softmax"):
+    ...
+```
+
+Named loops go directly in the `tiles()` body, where they split it into **stretches**: the
+stretch of a loop runs from the end of the previous named loop to the start of the next one,
+so the statements between two loops belong to both. The `pin-check` pass makes sure that a
+pinned buffer
+
+- is used only in the stretch of its loop; a transfer or job uses its buffers until its
+  `.wait()`;
+- in the statements between its loop and the next one, is used before every buffer pinned to
+  the next loop;
 - is not accessed by other tiles (`.at()`, `.at_rel()`, `.row`, `.col`), which could still be
   writing into it after this tile has moved on.
 
-`pin=("qk", "sm")` pins a buffer to several loops, which must be back-to-back: it lives from
-the stretch of the first to the stretch of the last, and keeps its contents in between. Each
-buffer goes right above the earlier buffers whose loops overlap its own, so declare the
-longer-lived ones first; when several of those could be the highest (sizes are run-time
-values), its address is their largest end, computed at run time.
+`pin=("qk", "softmax")` pins a buffer to several loops, which must be back-to-back: it lives
+from the stretch of the first to the stretch of the last, and keeps its contents in between.
+
+Layout: each buffer goes right above the earlier buffers whose loops overlap its own (an
+unpinned buffer overlaps every loop), so declare the longer-lived buffers first. Sizes are
+run-time values, so when several of those buffers could be the highest one, the address is
+their largest end, computed at run time. Without pins, the layout is the plain sequence of
+the buffers in declaration order.
 
 #### Depths
 
@@ -411,6 +434,7 @@ for (int t = 0; t < max(skew + n) + S - 2; t++) {   // computed by mgc, same on 
 | `skew` | delay, in steps, of this tile with respect to tile 0; usually a function of `y_id`/`x_id` (in `mm_ws`, `skew = 2 * y_id`: a block takes one step to compute and one to travel to the tile below) |
 | `sync=SCOPE` | the barrier ending every time step (required) |
 | `time="t"` | name of the time-loop variable |
+| `name="ws"` | names the loop, for the buffers pinned to it (see [Pinning buffers to loops](#pinning-buffers-to-loops)) |
 
 - The length of the time loop is computed by mgc: it must be the same on every tile and cover
   the latest one, so it is `max(skew + n) + S - 2` over the mesh. mgc inlines the
@@ -528,10 +552,11 @@ IR conventions:
 |---|---|
 | `legalize-idma` | views → N-dimensional transfers, checked against `devices.IDMA`; base and per-transfer L2 addresses |
 | `uninit-acc` | GEMM jobs whose accumulator is not initialized → MATMUL (`if_uninit` in the descriptors), always or in the first iteration of their loops |
-| `pipeline` | `mg.pipeline` + `mg.stage` blocks → prologue and guarded step loop; depth inference/checks, per-iteration events, HWPE queue simulation |
+| `pin-check` | checks the buffers pinned to named loops (`pin=`) against the stretches of their loops; records each one's loops for `l1-layout` |
+| `pipeline` | `mg.pipeline` + `mg.stage` blocks → prologue and guarded step loop, one loop at a time; depth inference/checks (over all the loops), per-iteration events, HWPE queue simulation |
 | `job-lower` | `mg.job` → RedMulE one-shot or CV32 call; parameters and shape checks from the descriptors; folds the `uninit-acc` conditions |
-| `multi-buffer` | slot indices → static addresses or rotating pointers with an `if`/`switch` selection |
-| `l1-layout` | identical L1 layout on all tiles; uses `*_max` tile sizes when buffers are accessed remotely; neighbour L1 bases |
+| `multi-buffer` | slot indices → static addresses or rotating pointers with an `if`/`switch` selection, one per loop |
+| `l1-layout` | identical L1 layout on all tiles, shared between loops for pinned buffers; uses `*_max` tile sizes when buffers are accessed remotely; neighbour L1 bases |
 | `event-alloc` | event variable names; dataflow check of issue/wait |
 | `idma-mcast` | row/column multicasts → loops of unicast transfers, unless `devices.IDMA.multicast` lists the scope |
 | `emit-c` | prints C; each buffer's `len_/std_/reps_/l1_addr_/l2_addr_` is declared once and referenced by name |
