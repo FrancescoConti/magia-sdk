@@ -17,8 +17,7 @@ void MAGIA_rowmax_fp16_spatz_l1(
         .shard_X = (uintptr_t)X,
         .shard_P = (uintptr_t)P,
         .shard_M = (uintptr_t)M,
-        .rows    = rows,
-        .cols    = cols,
+        .dims    = rows | (cols << 16),
     };
     int ret;
 

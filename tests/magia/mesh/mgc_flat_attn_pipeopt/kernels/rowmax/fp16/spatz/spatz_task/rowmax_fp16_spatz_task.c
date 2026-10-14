@@ -8,8 +8,7 @@
    element-wise max with the previous row max. */
 int rowmax_fp16_spatz_task(void)
 {
-    volatile rowmax_fp16_spatz_params_t *params;
-    uintptr_t params_addr;
+    const rowmax_fp16_spatz_params_t *params;
     const _Float16 *X;
     const _Float16 *P;
     _Float16 *M;
@@ -18,14 +17,13 @@ int rowmax_fp16_spatz_task(void)
     size_t row_stride;
     size_t vl;
 
-    params_addr = mmio32(SPATZ_DATA);
-    params      = (volatile rowmax_fp16_spatz_params_t *)params_addr;
+    params = (const rowmax_fp16_spatz_params_t *)mmio32(SPATZ_DATA);
 
     X    = (const _Float16 *)params->shard_X;
     P    = (const _Float16 *)params->shard_P;
     M    = (_Float16 *)params->shard_M;
-    rows = params->rows;
-    cols = params->cols;
+    rows = params->dims & 0xffff;
+    cols = params->dims >> 16;
 
     if (MISALIGNED(M) || MISALIGNED(P))
         return 1;

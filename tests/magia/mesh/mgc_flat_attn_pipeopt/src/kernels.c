@@ -14,10 +14,10 @@
 #include "tile.h"
 #include "add_fp16_spatz.h"
 #include "rowdiv_fp16_spatz.h"
+#include "colmax_fp16_spatz_params.h"
 #include "colsum_rescale_fp16_spatz_params.h"
-#include "expminus_rowsum_fp16_spatz_params.h"
+#include "expminus_rowsum_fp16_spatz.h"
 #include "memset_fp16_spatz_params.h"
-#include "reducemax_fp16_spatz_params.h"
 #include "rowmax_fp16_spatz_params.h"
 #include "rowscale_fp16_spatz_params.h"
 #include "eventunit.h"
@@ -28,12 +28,12 @@ static volatile uint8_t spatz_ready __attribute__((section(".tile_bss")));
 
 /* Per-tile Spatz task parameters, one block per kernel of the K/V loop, preallocated in the
    per-tile L1 so that each call only stores the pointers that change (fixed fields are set on
-   the first call, flagged by their non-zero size). */
+   the first call, flagged by their non-zero sizes). */
 static struct {
     memset_fp16_spatz_params_t memset;
     rowscale_fp16_spatz_params_t rowscale;
     rowmax_fp16_spatz_params_t rowmax;
-    reducemax_fp16_spatz_params_t colmax;
+    colmax_fp16_spatz_params_t colmax;
     expminus_rowsum_fp16_spatz_params_t expminus_rowsum;
     colsum_rescale_fp16_spatz_params_t colsum_rescale;
 } spatz_params __attribute__((section(".tile_bss")));
@@ -98,10 +98,9 @@ void l1_rowmax_fp16_spatz(uint32_t m, uint32_t x, uint32_t rows, uint32_t cols)
 {
     rowmax_fp16_spatz_params_t *p = &spatz_params.rowmax;
 
-    if (!p->cols) {
+    if (!p->dims) {
         p->shard_M = m;
-        p->rows    = rows;
-        p->cols    = cols;
+        p->dims    = rows | (cols << 16);
     }
     p->shard_X = x;
     p->shard_P = 0;
@@ -115,10 +114,9 @@ void l1_rowmax_max_fp16_spatz(uint32_t m, uint32_t x, uint32_t pm, uint32_t rows
 {
     rowmax_fp16_spatz_params_t *p = &spatz_params.rowmax;
 
-    if (!p->cols) {
+    if (!p->dims) {
         p->shard_M = m;
-        p->rows    = rows;
-        p->cols    = cols;
+        p->dims    = rows | (cols << 16);
     }
     p->shard_X = x;
     p->shard_P = pm;
@@ -131,16 +129,14 @@ void l1_rowmax_max_fp16_spatz(uint32_t m, uint32_t x, uint32_t pm, uint32_t rows
  */
 void l1_colmax_fp16_spatz(uint32_t m, uint32_t x, uint32_t rows, uint32_t cols)
 {
-    reducemax_fp16_spatz_params_t *p = &spatz_params.colmax;
+    colmax_fp16_spatz_params_t *p = &spatz_params.colmax;
 
-    if (!p->reduce_dim) {
-        p->shard_X    = x;
-        p->reduce_dim = rows;
-        p->inner_dim  = cols;
-        p->outer_len  = 1;
+    if (!p->dims) {
+        p->shard_X = x;
+        p->dims    = rows | (cols << 16);
     }
-    p->shard_Y = m;
-    spatz_offload(REDUCEMAX_FP16_SPATZ_TASK, p);
+    p->shard_M = m;
+    spatz_offload(COLMAX_FP16_SPATZ_TASK, p);
 }
 
 /* Sets the fixed fields of the expminus_rowsum block, with the scale 1/sqrt(PROJ_SIZE). */
@@ -148,11 +144,8 @@ static inline void expminus_rowsum_init(expminus_rowsum_fp16_spatz_params_t *p,
                                         uint32_t rows,
                                         uint32_t cols)
 {
-    float16 s = (float16)(1.0f / __builtin_sqrtf((float)PROJ_SIZE));
-
-    p->rows  = rows;
-    p->cols  = cols;
-    p->scale = ((union { float16 f; uint16_t u; }){.f = s}).u;
+    expminus_rowsum_fp16_spatz_set_scale(
+        p, (float16)(1.0f / __builtin_sqrtf((float)PROJ_SIZE)), rows, cols);
 }
 
 /**
@@ -164,7 +157,7 @@ void l1_expminus_rowsum_fp16_spatz(
 {
     expminus_rowsum_fp16_spatz_params_t *p = &spatz_params.expminus_rowsum;
 
-    if (!p->cols)
+    if (!p->dims)
         expminus_rowsum_init(p, rows, cols);
     p->shard_X = x;
     p->shard_M = m;
@@ -182,7 +175,7 @@ void l1_expminus_rowsum_alpha_fp16_spatz(
 {
     expminus_rowsum_fp16_spatz_params_t *p = &spatz_params.expminus_rowsum;
 
-    if (!p->cols)
+    if (!p->dims)
         expminus_rowsum_init(p, rows, cols);
     p->shard_X = x;
     p->shard_M = m;
@@ -199,10 +192,9 @@ void l1_colsum_acc_fp16_spatz(uint32_t s, uint32_t g, uint32_t rows, uint32_t co
 {
     colsum_rescale_fp16_spatz_params_t *p = &spatz_params.colsum_rescale;
 
-    if (!p->cols) {
+    if (!p->dims) {
         p->shard_G = g;
-        p->rows    = rows;
-        p->cols    = cols;
+        p->dims    = rows | (cols << 16);
     }
     p->shard_S = s;
     p->shard_P = 0;
@@ -218,10 +210,9 @@ void l1_colsum_acc_rescale_fp16_spatz(
 {
     colsum_rescale_fp16_spatz_params_t *p = &spatz_params.colsum_rescale;
 
-    if (!p->cols) {
+    if (!p->dims) {
         p->shard_G = g;
-        p->rows    = rows;
-        p->cols    = cols;
+        p->dims    = rows | (cols << 16);
     }
     p->shard_S = s;
     p->shard_P = pp;

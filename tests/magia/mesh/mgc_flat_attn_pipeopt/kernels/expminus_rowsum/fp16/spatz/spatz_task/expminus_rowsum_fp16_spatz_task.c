@@ -6,17 +6,13 @@
 
 /* Fuses expminus (with the scale folded into the exp), reducesum over the last axis and
    exp of the max difference, with the same arithmetic as the separate kernels.
-   Fast exp as the exp kernel (Schraudolph 1999): exp(x) ~ reinterpret_fp16(COEF * x + BIAS).
-   exp(s * x) uses COEF * s and the clamps divided by s: exact if s is a power of 2. */
-#define EXP_MIN  (-10.0f)
-#define EXP_MAX  (+10.0f)
-#define EXP_COEF (1477.0f)
-#define EXP_BIAS (15360.0f)
+   exp(s * x) uses COEF * s and the clamps divided by s, precomputed by the caller: exact if s
+   is a power of 2. */
 
 /* v0 = reinterpret_fp16(coef * max(v0, min) + BIAS). */
 static inline void fast_exp_v0(_Float16 min, _Float16 coef)
 {
-    register _Float16 bias asm("f11") = EXP_BIAS;
+    register _Float16 bias asm("f11") = EXPMINUS_ROWSUM_EXP_BIAS;
 
     asm volatile("vfmax.vf v0, v0, %0" ::"f"(min));
     asm volatile("vfmul.vf v0, v0, %0" ::"f"(coef));
@@ -92,31 +88,30 @@ static inline void exp_diff(_Float16 *A, const _Float16 *M, size_t rows, _Float1
 
 int expminus_rowsum_fp16_spatz_task(void)
 {
-    volatile expminus_rowsum_fp16_spatz_params_t *params;
-    uintptr_t params_addr;
+    const expminus_rowsum_fp16_spatz_params_t *params;
     const _Float16 *X;
     const _Float16 *M;
     _Float16 *Y;
     _Float16 *S;
     _Float16 *A;
-    union { uint16_t u; _Float16 f; } scale;
-    float s;
-    _Float16 min, max, coef;
+    union { uint32_t u; _Float16 f[2]; } min_max, coef;
+    _Float16 min, max;
     size_t rows;
     size_t cols;
 
-    params_addr = mmio32(SPATZ_DATA);
-    params      = (volatile expminus_rowsum_fp16_spatz_params_t *)params_addr;
+    params = (const expminus_rowsum_fp16_spatz_params_t *)mmio32(SPATZ_DATA);
 
     X          = (const _Float16 *)params->shard_X;
     M          = (const _Float16 *)params->shard_M;
     Y          = (_Float16 *)params->shard_Y;
     S          = (_Float16 *)params->shard_S;
     A          = (_Float16 *)params->shard_A;
-    rows       = params->rows;
-    cols       = params->cols;
-    scale.u    = (uint16_t)params->scale;
-    s          = (float)scale.f;
+    rows       = params->dims & 0xffff;
+    cols       = params->dims >> 16;
+    min_max.u  = params->min_max;
+    coef.u     = params->coef;
+    min        = min_max.f[0];
+    max        = min_max.f[1];
 
     if (rows == 0 || cols == 0)
         return 0;
@@ -126,17 +121,13 @@ int expminus_rowsum_fp16_spatz_task(void)
         MISALIGNED(M))
         return 1;
 
-    min  = (_Float16)(EXP_MIN / s);
-    max  = (_Float16)(EXP_MAX / s);
-    coef = (_Float16)(EXP_COEF * s);
-
     for (size_t r = 0; r < rows; r++)
-        expminus_row(X + r * cols, Y + r * cols, cols, M[r], min, coef);
+        expminus_row(X + r * cols, Y + r * cols, cols, M[r], min, coef.f[0]);
 
     rowsum(Y, S, rows, cols);
 
     if (A)
-        exp_diff(A, M, rows, min, max, coef);
+        exp_diff(A, M, rows, min, max, coef.f[0]);
 
     return 0;
 }

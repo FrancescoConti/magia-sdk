@@ -18,8 +18,7 @@ void MAGIA_colsum_rescale_fp16_spatz_l1(
         .shard_G = (uintptr_t)G,
         .shard_P = (uintptr_t)P,
         .shard_A = (uintptr_t)A,
-        .rows    = rows,
-        .cols    = cols,
+        .dims    = rows | (cols << 16),
     };
     int ret;
 

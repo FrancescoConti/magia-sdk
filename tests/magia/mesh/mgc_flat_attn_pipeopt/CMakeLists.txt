@@ -11,8 +11,8 @@ set(TEST_NAME test_mgc_flat_attn_pipeopt)
 set(KERNELS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../../kernels)
 set(LOCAL_KERNELS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/kernels)
 # Generic kernels from kernels/, merged softmax kernels from this test's kernels/
-set(SPATZ_KERNELS add memset reducemax rowdiv rowscale)
-set(LOCAL_SPATZ_KERNELS colsum_rescale expminus_rowsum rowmax)
+set(SPATZ_KERNELS add memset rowdiv rowscale)
+set(LOCAL_SPATZ_KERNELS colmax colsum_rescale expminus_rowsum rowmax)
 
 # All the Spatz kernels in one task binary -> mgc_flat_attn_pipeopt_spatz_task_bin.h
 set(SPATZ_TASK_SRCS)

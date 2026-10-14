@@ -8,8 +8,7 @@
    reducesum), mul and add, with the same arithmetic as the separate kernels. */
 int colsum_rescale_fp16_spatz_task(void)
 {
-    volatile colsum_rescale_fp16_spatz_params_t *params;
-    uintptr_t params_addr;
+    const colsum_rescale_fp16_spatz_params_t *params;
     register _Float16 zero asm("fs0") = 0.0f;
     _Float16 *S;
     const _Float16 *G;
@@ -19,15 +18,14 @@ int colsum_rescale_fp16_spatz_task(void)
     size_t cols;
     size_t vl;
 
-    params_addr = mmio32(SPATZ_DATA);
-    params      = (volatile colsum_rescale_fp16_spatz_params_t *)params_addr;
+    params = (const colsum_rescale_fp16_spatz_params_t *)mmio32(SPATZ_DATA);
 
     S    = (_Float16 *)params->shard_S;
     G    = (const _Float16 *)params->shard_G;
     P    = (_Float16 *)params->shard_P;
     A    = (const _Float16 *)params->shard_A;
-    rows = params->rows;
-    cols = params->cols;
+    rows = params->dims & 0xffff;
+    cols = params->dims >> 16;
 
     if (MISALIGNED(S) || MISALIGNED(G) || MISALIGNED(P) || MISALIGNED(A) || (cols & 1))
         return 1;

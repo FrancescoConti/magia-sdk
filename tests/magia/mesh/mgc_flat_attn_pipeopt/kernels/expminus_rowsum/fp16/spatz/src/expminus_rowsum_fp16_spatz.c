@@ -19,17 +19,17 @@ void MAGIA_expminus_rowsum_fp16_spatz_l1(const float16 *X,
                                          uint32_t rows,
                                          uint32_t cols)
 {
-    volatile expminus_rowsum_fp16_spatz_params_t params = {
+    expminus_rowsum_fp16_spatz_params_t params = {
         .shard_X = (uintptr_t)X,
         .shard_M = (uintptr_t)M,
         .shard_Y = (uintptr_t)Y,
         .shard_S = (uintptr_t)S,
         .shard_A = (uintptr_t)A,
-        .rows    = rows,
-        .cols    = cols,
-        .scale   = ((union { float16 f; uint16_t u; }){.f = s}).u,
     };
     int ret;
+
+    expminus_rowsum_fp16_spatz_set_scale(&params, s, rows, cols);
+    asm volatile("" ::: "memory");
 
     spatz_run_task_with_params(EXPMINUS_ROWSUM_FP16_SPATZ_TASK, (uint32_t)&params);
 
