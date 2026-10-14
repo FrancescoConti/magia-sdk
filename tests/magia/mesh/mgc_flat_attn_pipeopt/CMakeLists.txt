@@ -33,6 +33,9 @@ add_spatz_task(
   TASK_SOURCES ${SPATZ_TASK_SRCS}
   FIRST_TASK_NAME add_fp16_spatz_task
   INCLUDE_DIRS ${SPATZ_KERNEL_INCS}
+  # Run on every K/V step, in this order
+  HOT_TASKS rowscale_fp16_spatz_task rowmax_fp16_spatz_task colmax_fp16_spatz_task
+            expminus_rowsum_fp16_spatz_task colsum_rescale_fp16_spatz_task
 )
 
 # Each kernel source includes its own <kernel>_task_bin.h: point them all to the shared header,

@@ -20,11 +20,19 @@ static inline void fast_exp_v0(_Float16 min, _Float16 coef)
     asm volatile("vfcvt.rtz.xu.f.v v0, v0");
 }
 
-/* One row, vectorized along cols. A misaligned row (odd cols) peels its first element. */
-static inline void expminus_row(
-    const _Float16 *src, _Float16 *dst, size_t len, _Float16 m, _Float16 min, _Float16 coef)
+/* One row, vectorized along cols. A misaligned row (odd cols) peels its first element.
+   Returns *m_next, loaded before the row's store: a scalar load stalls on a pending vector
+   store, which would drain the VU at every row. */
+static inline _Float16 expminus_row(const _Float16 *src,
+                                    _Float16 *dst,
+                                    size_t len,
+                                    _Float16 m,
+                                    const _Float16 *m_next,
+                                    _Float16 min,
+                                    _Float16 coef)
 {
     _Float16 first;
+    _Float16 next;
     size_t vl;
 
     if (MISALIGNED(src)) {
@@ -38,12 +46,43 @@ static inline void expminus_row(
         len--;
     }
 
+    if (len == 0)
+        return *m_next;
+
     for (; len > 0; len -= vl, src += vl, dst += vl) {
         asm volatile("vsetvli %0, %1, e16, m8, ta, ma" : "=r"(vl) : "r"(len));
         asm volatile("vle16.v v0, (%0)" ::"r"(src));
         asm volatile("vfsub.vf v0, v0, %0" ::"f"(m));
         fast_exp_v0(min, coef);
+        asm volatile("flh %0, 0(%1)" : "=f"(next) : "r"(m_next));
         asm volatile("vse16.v v0, (%0)" ::"r"(dst) : "memory");
+    }
+
+    return next;
+}
+
+/* expminus_row on all rows, for aligned rows of at most VLMAX elements with vl set by the
+   caller. The VU queues only 4 instructions, so the scalar work between rows (no vsetvli,
+   peeling or strip loop here) must fit under the previous row's tail. */
+static inline void expminus_rows_1strip(const _Float16 *X,
+                                        _Float16 *Y,
+                                        const _Float16 *M,
+                                        size_t rows,
+                                        size_t cols,
+                                        _Float16 min,
+                                        _Float16 coef)
+{
+    const _Float16 *m_last = M + rows - 1;
+    _Float16 m             = *M;
+    _Float16 next;
+
+    for (size_t r = 0; r < rows; r++, X += cols, Y += cols, m = next) {
+        M = M < m_last ? M + 1 : M;
+        asm volatile("vle16.v v0, (%0)" ::"r"(X));
+        asm volatile("vfsub.vf v0, v0, %0" ::"f"(m));
+        fast_exp_v0(min, coef);
+        asm volatile("flh %0, 0(%1)" : "=f"(next) : "r"(M));
+        asm volatile("vse16.v v0, (%0)" ::"r"(Y) : "memory");
     }
 }
 
@@ -86,6 +125,35 @@ static inline void exp_diff(_Float16 *A, const _Float16 *M, size_t rows, _Float1
     }
 }
 
+/* The whole kernel, for any rows. Cold: linked out of the hot tasks, and the task does not
+   spill callee-saved registers for it. */
+static __attribute__((noinline, cold)) int expminus_rowsum_any(const _Float16 *X,
+                                                              _Float16 *Y,
+                                                              const _Float16 *M,
+                                                              _Float16 *S,
+                                                              _Float16 *A,
+                                                              size_t rows,
+                                                              size_t cols,
+                                                              _Float16 min,
+                                                              _Float16 max,
+                                                              _Float16 coef)
+{
+    _Float16 m = M[0];
+
+    for (size_t r = 0; r < rows; r++) {
+        const _Float16 *m_next = M + (r + 1 < rows ? r + 1 : r);
+
+        m = expminus_row(X + r * cols, Y + r * cols, cols, m, m_next, min, coef);
+    }
+
+    rowsum(Y, S, rows, cols);
+
+    if (A)
+        exp_diff(A, M, rows, min, max, coef);
+
+    return 0;
+}
+
 int expminus_rowsum_fp16_spatz_task(void)
 {
     const expminus_rowsum_fp16_spatz_params_t *params;
@@ -121,8 +189,12 @@ int expminus_rowsum_fp16_spatz_task(void)
         MISALIGNED(M))
         return 1;
 
-    for (size_t r = 0; r < rows; r++)
-        expminus_row(X + r * cols, Y + r * cols, cols, M[r], min, coef.f[0]);
+    size_t vl;
+    asm volatile("vsetvli %0, %1, e16, m8, ta, ma" : "=r"(vl) : "r"(cols));
+    if (vl != cols || MISALIGNED(X) || (cols & 1))
+        return expminus_rowsum_any(X, Y, M, S, A, rows, cols, min, max, coef.f[0]);
+
+    expminus_rows_1strip(X, Y, M, rows, cols, min, coef.f[0]);
 
     rowsum(Y, S, rows, cols);
 
