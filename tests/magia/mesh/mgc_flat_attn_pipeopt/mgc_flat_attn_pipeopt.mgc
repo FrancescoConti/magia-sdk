@@ -17,8 +17,8 @@ o_   = l2("o_out",  (S, P),    fp16)
 o_gold = l2("o_gold", (S, P),  fp16)  # golden
 
 WAIT_MODE = define(WFE)
-S_BLOCK_SIZE_Q  = define(64)
-S_BLOCK_SIZE_KV = define(64)
+S_BLOCK_SIZE_Q  = define(512)
+S_BLOCK_SIZE_KV = define(512)
 
 # Implemented in src/kernels.c, synchronous on the tile's CV32 core.
 # memset_zero: y[:] = 0 on Spatz (vse16.v of a zeroed register).

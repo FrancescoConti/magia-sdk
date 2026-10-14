@@ -16,8 +16,8 @@
 #include "mg_event.h"
 
 #define WAIT_MODE       WFE
-#define S_BLOCK_SIZE_Q  64
-#define S_BLOCK_SIZE_KV 64
+#define S_BLOCK_SIZE_Q  512
+#define S_BLOCK_SIZE_KV 512
 
 /** L1 kernel (CORE): all pointers are L1 addresses. */
 extern void l1_memset_zero_fp16_spatz(uint32_t y, uint32_t p0);
