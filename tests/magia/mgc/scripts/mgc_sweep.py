@@ -9,9 +9,13 @@ compare cycles, MAC/cycle and the utilization of RedMulE, iDMA and Spatz.
 
 The runs are ordered by mesh side; gvsoc is rebuilt for each mesh side with
     make gvsoc tiles=<N> pulp_cluster=0
-and each configuration is built and run, one at a time, with
-    make clean build run_profiling platform=gvsoc tiles=<N> test=<test> pulp_cluster=0
-and measured on gvsoc_work/trace.perfetto-trace:
+and each configuration is built, one at a time, and run with
+    make build tiles=<N> test=<test> pulp_cluster=0
+    make run_profiling platform=gvsoc tiles=<N> test=<test> pulp_cluster=0
+and measured on gvsoc_work/trace.perfetto-trace. With --jobs J, up to J runs of the same mesh
+side simulate in parallel, each with its own CMAKE_BUILDDIR and GVSOC_WORK_DIR (job 0: build/
+and gvsoc_work/, the others in <out>/jobs/<k>/); builds stay serial, as they share the test
+sources. Metrics:
   - cycles: from tile 0's entry in main to the exit of the last tile other than tile 0, i.e.
     without crt0 init and without tile 0's final check()
   - MAC/cycle: matmul MACs only / cycles: M*N*K*N_ITERATIONS for mm, 2*S*S*P for attention
@@ -33,7 +37,7 @@ parameters take each test's default), e.g.
     ]}
 or a single group from the command line:
     tests/magia/mgc/scripts/mgc_sweep.py --tests unfused_attn flat_attn_pipeopt3 --tiles 2 4 [--S 512 1024 ...]
-    tests/magia/mgc/scripts/mgc_sweep.py --sweep sweep.json [--out DIR] [--dry-run] [--keep-traces]
+    tests/magia/mgc/scripts/mgc_sweep.py --sweep sweep.json [--out DIR] [--jobs J] [--dry-run] [--keep-traces]
     tests/magia/mgc/scripts/mgc_sweep.py --list
 
 Output in --out: summary.log (human-readable table), results.csv (one row per run, plain
@@ -53,11 +57,15 @@ import itertools
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, wait
+from queue import Queue
 
 import numpy as np
 
@@ -71,6 +79,14 @@ CYCLE_NS = 5  # gvsoc clock: 200 MHz, perfetto timestamps in ns
 PARAMS = ['S', 'D', 'P', 'H', 'S_BLOCK_SIZE_Q', 'S_BLOCK_SIZE_KV']
 HEADER_DEFINES = {'S': 'SEQ_LENGTH', 'D': 'EMBED_SIZE', 'P': 'PROJ_SIZE', 'H': 'NUM_HEADS'}
 MGC_DEFINES = ['S_BLOCK_SIZE_Q', 'S_BLOCK_SIZE_KV']
+# Only the gvsoc events analyze() reads (make's defaults dump ~20x more: asm, NoC, L2, ...),
+# as POSIX basic regexes for gvsoc and as a regex of the gvsoc2perfetto tracks they become
+PROFILE_EVENTS = ["'/tile-[0-9]*-%s$$'" % e for e in (
+    'cv32-core/busy', 'cv32-core/active_pc', 'redmule/busy', 'idma-[a-z0-9]*/be/busy',
+    'snitch-spatz/active_pc', 'snitch-spatz/ara/active')]
+PERFETTO_INCLUDE = (r'(?x) tile-\d+-cv32-core\.(busy|active_pc)$$ | tile-\d+-redmule\.busy$$'
+                    r' | tile-\d+-idma-(axi2obi|obi2axi)\.be\.busy$$'
+                    r' | tile-\d+-snitch-spatz\.(active_pc|ara\.active)$$')
 # Spatz runtime outside of any task (boot, dispatcher, interrupt handling)
 SPATZ_IDLE_FUNCS = {'_start', 'dispatcher_loop', '_trap_handler', '_handle_exception',
                     '_handle_interrupt', '_trap_ret'}
@@ -274,30 +290,68 @@ def generate(test, cfg, tiles, args, srcs, log):
 # Build + run
 # --------------------------------------------------------------------------------------------
 
+PROCS = set()  # running make process groups, killed on interrupt
+STOP = threading.Event()
+
+
 def make(cmd):
+    """Run cmd in its own process group; return (return code, output)."""
     env_setup = 'source sourceme.sh && ' if os.path.exists(os.path.join(REPO, 'sourceme.sh')) else ''
-    return subprocess.run(['bash', '-c', env_setup + cmd], cwd=REPO, stdout=subprocess.PIPE,
-                          stderr=subprocess.STDOUT, text=True, errors='replace')
+    p = subprocess.Popen(['bash', '-c', env_setup + cmd], cwd=REPO, stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT, text=True, errors='replace', start_new_session=True)
+    PROCS.add(p)
+    try:
+        out = p.communicate()[0]
+    except BaseException:
+        kill(p)
+        raise
+    finally:
+        PROCS.discard(p)
+    return p.returncode, out
+
+
+def kill(p):
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+def slot_dirs(out, slot):
+    """(CMAKE_BUILDDIR, GVSOC_WORK_DIR) of a parallel job slot."""
+    if slot == 0:
+        return os.path.join(REPO, 'build'), os.path.join(REPO, 'gvsoc_work')
+    d = os.path.join(out, 'jobs', str(slot))
+    return os.path.join(d, 'build'), os.path.join(d, 'gvsoc_work')
 
 
 def build_gvsoc(tiles, logf):
     """gvsoc is built for one mesh side: rebuild it whenever tiles changes."""
-    cmd = 'make gvsoc tiles=%d pulp_cluster=0' % tiles
-    r = make(cmd)
-    write(logf, '$ ' + cmd + '\n' + r.stdout)
-    return r.returncode
-
-
-def run_make(test, tiles, logf):
-    cmd = 'make clean build run_profiling platform=gvsoc tiles=%d test=%s pulp_cluster=0' % (tiles, test.target)
-    for _ in range(2):
-        r = make(cmd)
-        out = r.stdout
-        # a fresh build dir can fail the binary check: rerun once the binary exists
-        if 'No test found' not in out:
-            break
+    # gvsoc2perfetto too, so that parallel run_profiling do not race to build it
+    cmd = 'make gvsoc tiles=%d pulp_cluster=0 && make gvsoc2perfetto' % tiles
+    rc, out = make(cmd)
     write(logf, '$ ' + cmd + '\n' + out)
-    return r.returncode, out
+    return rc
+
+
+def build_test(test, tiles, build, logf):
+    shutil.rmtree(build, ignore_errors=True)
+    cmd = 'make build tiles=%d test=%s pulp_cluster=0 CMAKE_BUILDDIR=%s' % (tiles, test.target, build)
+    rc, out = make(cmd)
+    write(logf, '$ ' + cmd + '\n' + out)
+    return rc
+
+
+def run_test(test, tiles, build, work, logf, full_trace):
+    cmd = ('make run_profiling platform=gvsoc tiles=%d test=%s pulp_cluster=0 CMAKE_BUILDDIR=%s '
+           'GVSOC_WORK_DIR=%s' % (tiles, test.target, build, work))
+    if not full_trace:
+        cmd += ' ' + shlex.quote('profile_events=' + ' '.join(PROFILE_EVENTS))
+        cmd += ' ' + shlex.quote('GVSOC2PERFETTO_INCLUDE=' + PERFETTO_INCLUDE)
+    rc, out = make(cmd)
+    with open(logf, 'a') as f:
+        f.write('$ ' + cmd + '\n' + out)
+    return rc, out
 
 
 def parse_run(out):
@@ -346,15 +400,15 @@ def overlap(a, b):
     return int(t)
 
 
-def spatz_idle_pcs(test):
+def spatz_idle_pcs(test, build):
     """Absolute [lo, hi) PC ranges of the Spatz runtime outside tasks, and the binary's range."""
-    m = re.search(r'^CMAKE_NM:FILEPATH=(.+)$', read(os.path.join(REPO, 'build', 'CMakeCache.txt')), re.M)
+    m = re.search(r'^CMAKE_NM:FILEPATH=(.+)$', read(os.path.join(build, 'CMakeCache.txt')), re.M)
     nm = m.group(1) if m else 'riscv64-unknown-elf-nm'
-    syms = subprocess.run([nm, os.path.join(REPO, 'build', 'bin', test.target)], capture_output=True,
+    syms = subprocess.run([nm, os.path.join(build, 'bin', test.target)], capture_output=True,
                           text=True).stdout
     addr = {m.group(2): int(m.group(1), 16) for m in re.finditer(r'^([0-9a-f]+) \w (\w+)$', syms, re.M)}
     base, end = addr['_spatz_binary_start'], addr['_spatz_binary_end']
-    dump = glob.glob(os.path.join(REPO, 'build', 'bin', 'magia', test.spatz_name, 'spatz_task', '*.dump'))[0]
+    dump = glob.glob(os.path.join(build, 'bin', 'magia', test.spatz_name, 'spatz_task', '*.dump'))[0]
     funcs, in_text = [], False
     for line in open(dump):
         if line.startswith('Disassembly of section'):
@@ -367,7 +421,7 @@ def spatz_idle_pcs(test):
     return idle, (base, end)
 
 
-def analyze(test, trace, kills, n_tiles):
+def analyze(test, trace, kills, n_tiles, build):
     from perfetto.trace_processor import TraceProcessor, TraceProcessorConfig
     tp = TraceProcessor(trace=trace, config=TraceProcessorConfig(load_timeout=1800))
     try:
@@ -391,7 +445,7 @@ def analyze(test, trace, kills, n_tiles):
         lo, hi = int(main0), max(others) * CYCLE_NS
 
         # Spatz busy: Snitch PC outside the runtime's idle code (dispatcher, traps, boot)
-        idle, (base, end) = spatz_idle_pcs(test) if test.spatz_name else ([], (0, 0))
+        idle, (base, end) = spatz_idle_pcs(test, build) if test.spatz_name else ([], (0, 0))
         spatz_busy = {}
         pc_tracks = {t: tid for (t, n), tid in tracks.items() if n == 'snitch-spatz.pc'}
         if pc_tracks:
@@ -453,24 +507,44 @@ def table(rows):
     return '\n'.join([line(cells[0]), '  '.join('-' * x for x in w)] + [line(r) for r in cells[1:]])
 
 
+def csv_row(row):
+    return ['' if row.get(c) is None else round(row[c], 4) if isinstance(row[c], float) else row[c]
+            for c in CSV_COLUMNS]
+
+
 class Report:
+    """summary.log and results.csv, shared by the parallel jobs."""
+
     def __init__(self, out):
         self.out = out
+        self.lock = threading.Lock()
+        self.rows = []
         self.logf = open(os.path.join(out, 'summary.log'), 'a')
         self.csvf = os.path.join(out, 'results.csv')
         with open(self.csvf, 'w', newline='') as f:
             csv.writer(f, lineterminator='\n').writerow(CSV_COLUMNS)
 
     def log(self, msg=''):
-        print(msg, flush=True)
-        self.logf.write(msg + '\n')
-        self.logf.flush()
+        with self.lock:
+            print(msg, flush=True)
+            self.logf.write(msg + '\n')
+            self.logf.flush()
 
     def add(self, row):
-        with open(self.csvf, 'a', newline='') as f:
-            csv.writer(f, lineterminator='\n').writerow(
-                ['' if row.get(c) is None else round(row[c], 4) if isinstance(row[c], float) else row[c]
-                 for c in CSV_COLUMNS])
+        with self.lock:
+            self.rows.append(row)
+            with open(self.csvf, 'a', newline='') as f:
+                csv.writer(f, lineterminator='\n').writerow(csv_row(row))
+
+    def sorted_rows(self):
+        """Rows in run order (parallel jobs complete out of order); rewrites results.csv so."""
+        with self.lock:
+            rows = sorted(self.rows, key=lambda r: r['run_id'])
+            with open(self.csvf, 'w', newline='') as f:
+                w = csv.writer(f, lineterminator='\n')
+                w.writerow(CSV_COLUMNS)
+                w.writerows(csv_row(r) for r in rows)
+        return rows
 
 
 # --------------------------------------------------------------------------------------------
@@ -501,6 +575,57 @@ def expand(groups, tests):
     return runs
 
 
+def simulate(t, cfg, tiles, row, rdir, slot, build, work, t0, tag, args, rep, free):
+    """Run a built configuration in job slot `slot`, measure it and add its row."""
+    try:
+        rc, outp = run_test(t, tiles, build, work, os.path.join(rdir, 'make.log'), args.keep_traces)
+        if STOP.is_set():
+            return
+        kills, errs = parse_run(outp)
+        row['sim_seconds'] = round(time.time() - t0, 1)
+        row['errors'] = sum(errs) if errs else None
+        if rc or len(kills) != tiles * tiles:
+            row['status'] = 'BUILD/RUN FAIL' if rc else 'NO EXIT'
+            rep.log('%s %s (rc=%d, %d/%d tiles exited), see %s' % (tag, row['status'], rc, len(kills),
+                                                                 tiles * tiles, rdir))
+        else:
+            row['status'] = 'PASS' if errs and sum(errs) == 0 else 'FAIL'
+            trace = os.path.join(work, 'trace.perfetto-trace')
+            lo, hi, per_tile = analyze(t, trace, kills, tiles * tiles, build)
+            cyc = hi - lo
+            macs = t.macs(cfg)
+            mean = {k: 100 * np.mean([pt[k] for pt in per_tile]) for k in per_tile[0]}
+            row.update(cycles=cyc, macs=macs, mac_per_cycle=macs / cyc,
+                       mac_per_cycle_per_tile=macs / cyc / (tiles * tiles),
+                       redmule_pct=mean['redmule'], idma_pct=mean['idma'], idma_in_pct=mean['idma_in'],
+                       idma_out_pct=mean['idma_out'], spatz_pct=mean['spatz'], spatz_vfu_pct=mean['vfu'],
+                       empty_pct=mean['empty'], empty_cv32_active_pct=mean['cv32_active'],
+                       empty_cv32_sleep_pct=mean['cv32_sleep'], main_start_cycle=lo, end_cycle=hi)
+            with open(os.path.join(rdir, 'per_tile.txt'), 'w') as f:
+                f.write('tile ' + ' '.join('%11s' % k for k in per_tile[0]) + '   (%)\n')
+                for k, pt in enumerate(per_tile):
+                    f.write('%4d ' % k + ' '.join('%11.1f' % (100 * v) for v in pt.values()) + '\n')
+            rep.log('%s %s: %s cycles, %.1f MAC/cycle, RedMulE %.1f%%, iDMA %.1f%%, Spatz %.1f%%, '
+                    'empty %.1f%% (%.1fs)' % (tag, row['status'], format(cyc, ','), macs / cyc,
+                                              mean['redmule'], mean['idma'], mean['spatz'],
+                                              mean['empty'], time.time() - t0))
+    except Exception as e:
+        if STOP.is_set():
+            return
+        row['status'] = 'ANALYSIS FAIL'
+        rep.log('%s analysis failed: %r' % (tag, e))
+    finally:
+        # traces are GBs: keep them only if asked (the VCD is left behind by a failed run)
+        trace = os.path.join(work, 'trace.perfetto-trace')
+        if args.keep_traces and os.path.exists(trace) and not STOP.is_set():
+            shutil.move(trace, rdir)
+        for f in (trace, os.path.join(work, 'all.vcd')):
+            if os.path.exists(f):
+                os.remove(f)
+        free.put(slot)
+    rep.add(row)
+
+
 def on_sigterm(*_):
     raise KeyboardInterrupt
 
@@ -519,10 +644,16 @@ def main():
     ap.add_argument('--mgcc-python', default=os.path.join(REPO, 'mgc', '.venv', 'bin', 'python')
                     if os.path.exists(os.path.join(REPO, 'mgc', '.venv', 'bin', 'python')) else 'python3',
                     help='Python with xDSL for mgcc (default: %(default)s)')
-    ap.add_argument('--keep-traces', action='store_true', help='keep each run\'s perfetto trace')
+    ap.add_argument('--jobs', '-j', type=int, default=1,
+                    help='gvsoc simulations of the same mesh side to run in parallel (default: 1)')
+    ap.add_argument('--keep-traces', action='store_true',
+                    help='keep each run\'s perfetto trace, with all of make\'s profile events (default: '
+                         'only the events the sweep measures, trace deleted after the analysis)')
     ap.add_argument('--dry-run', action='store_true', help='only list the configurations')
     ap.add_argument('--list', action='store_true', help='list the tests and their default parameters')
     args = ap.parse_args()
+    if args.jobs < 1:
+        ap.error('--jobs must be at least 1')
 
     tests = {n: Test(n) for n in list_tests()}
     if args.list:
@@ -557,7 +688,11 @@ def main():
     signal.signal(signal.SIGTERM, on_sigterm)
     rep.log('mgc sweep: %d configurations, output in %s' % (len(runs), out))
 
-    rows = []
+    pool = ThreadPoolExecutor(args.jobs)
+    free = Queue()  # job slots not running a simulation
+    for k in range(args.jobs):
+        free.put(k)
+    futures = []
     gvsoc_tiles, gvsoc_rc = None, 0  # mesh side gvsoc is built for, and its build's return code
     try:
         for i, (t, cfg, tiles) in enumerate(runs):
@@ -566,7 +701,8 @@ def main():
             os.makedirs(rdir, exist_ok=True)
             row = dict(run_id=rid, test=t.name, tiles=tiles, n_tiles=tiles * tiles, **cfg)
             desc = ' '.join('%s=%s' % (p, cfg[p]) for p in t.applicable())
-            rep.log('[%d/%d] %s tiles=%d %s' % (i + 1, len(runs), t.name, tiles, desc))
+            tag = '[%d/%d]' % (i + 1, len(runs))
+            rep.log('%s %s tiles=%d %s' % (tag, t.name, tiles, desc))
             t0 = time.time()
             why = t.check(cfg, tiles)
             if why is None and t.needs_regen(cfg, tiles):
@@ -575,6 +711,7 @@ def main():
                 for p in list(srcs.saved):  # back to the committed sources
                     shutil.copy2(srcs.saved[p], p)
             if why is None and tiles != gvsoc_tiles:
+                wait(futures)  # the running jobs use the current gvsoc
                 rep.log('  building gvsoc for tiles=%d...' % tiles)
                 gvsoc_tiles = tiles
                 gvsoc_rc = build_gvsoc(tiles, os.path.join(out, 'gvsoc_tiles%d.log' % tiles))
@@ -585,44 +722,34 @@ def main():
                 row['status'] = 'GVSOC FAIL'
                 rep.log('  gvsoc build failed (rc=%d), see %s' % (gvsoc_rc, os.path.join(out, 'gvsoc_tiles%d.log' % tiles)))
             else:
-                rc, outp = run_make(t, tiles, os.path.join(rdir, 'make.log'))
-                kills, errs = parse_run(outp)
-                row['sim_seconds'] = round(time.time() - t0, 1)
-                row['errors'] = sum(errs) if errs else None
-                if rc or len(kills) != tiles * tiles:
-                    row['status'] = 'BUILD/RUN FAIL' if rc else 'NO EXIT'
-                    rep.log('  %s (rc=%d, %d/%d tiles exited), see %s' % (row['status'], rc, len(kills),
-                                                                           tiles * tiles, rdir))
+                slot = free.get()
+                build, work = slot_dirs(out, slot)
+                rc = build_test(t, tiles, build, os.path.join(rdir, 'make.log'))
+                if rc:
+                    free.put(slot)
+                    row['status'] = 'BUILD/RUN FAIL'
+                    rep.log('  build failed (rc=%d), see %s' % (rc, rdir))
                 else:
-                    row['status'] = 'PASS' if errs and sum(errs) == 0 else 'FAIL'
-                    trace = os.path.join(REPO, 'gvsoc_work', 'trace.perfetto-trace')
-                    if args.keep_traces:
-                        shutil.copy2(trace, rdir)
-                    lo, hi, per_tile = analyze(t, trace, kills, tiles * tiles)
-                    cyc = hi - lo
-                    macs = t.macs(cfg)
-                    mean = {k: 100 * np.mean([pt[k] for pt in per_tile]) for k in per_tile[0]}
-                    row.update(cycles=cyc, macs=macs, mac_per_cycle=macs / cyc,
-                               mac_per_cycle_per_tile=macs / cyc / (tiles * tiles),
-                               redmule_pct=mean['redmule'], idma_pct=mean['idma'], idma_in_pct=mean['idma_in'],
-                               idma_out_pct=mean['idma_out'], spatz_pct=mean['spatz'], spatz_vfu_pct=mean['vfu'],
-                               empty_pct=mean['empty'], empty_cv32_active_pct=mean['cv32_active'],
-                               empty_cv32_sleep_pct=mean['cv32_sleep'], main_start_cycle=lo, end_cycle=hi)
-                    with open(os.path.join(rdir, 'per_tile.txt'), 'w') as f:
-                        f.write('tile ' + ' '.join('%11s' % k for k in per_tile[0]) + '   (%)\n')
-                        for k, pt in enumerate(per_tile):
-                            f.write('%4d ' % k + ' '.join('%11.1f' % (100 * v) for v in pt.values()) + '\n')
-                    rep.log('  %s: %s cycles, %.1f MAC/cycle, RedMulE %.1f%%, iDMA %.1f%%, Spatz %.1f%%, '
-                            'empty %.1f%% (%.1fs)' % (row['status'], format(cyc, ','), macs / cyc,
-                                                      mean['redmule'], mean['idma'], mean['spatz'],
-                                                      mean['empty'], time.time() - t0))
-            rows.append(row)
+                    if args.jobs > 1:
+                        rep.log('  simulating in job %d' % slot)
+                    # the sources may change from now on: the simulation only needs the build
+                    futures.append(pool.submit(simulate, t, cfg, tiles, row, rdir, slot, build, work, t0,
+                                               '  ' + tag if args.jobs > 1 else ' ', args, rep, free))
+                    continue
             rep.add(row)
+        wait(futures)
     except KeyboardInterrupt:
+        STOP.set()
+        for p in list(PROCS):
+            kill(p)
         rep.log('interrupted')
     finally:
+        pool.shutdown(wait=False, cancel_futures=True)
         srcs.restore()
+    if not STOP.is_set():
+        shutil.rmtree(os.path.join(out, 'jobs'), ignore_errors=True)
 
+    rows = rep.sorted_rows()
     rep.log('')
     rep.log('Utilization: % of the cycles from tile 0\'s main to the last exit of tiles != 0, mean over tiles.')
     rep.log('MAC: matmuls only (softmax = 0). empty = no RedMulE/iDMA/Spatz activity: CV32 running '
