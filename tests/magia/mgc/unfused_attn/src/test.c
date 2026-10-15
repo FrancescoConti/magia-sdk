@@ -18,7 +18,9 @@
 #define WAIT_MODE    WFE
 #define QK_TIMESLOTS 2
 #define PV_TIMESLOTS 8
-#define SM_CHUNK     32
+#define SM_CHUNK                                                                                   \
+    (SEQ_LENGTH / (MESH_X_TILES * MESH_Y_TILES) < 32 ? SEQ_LENGTH / (MESH_X_TILES * MESH_Y_TILES)  \
+                                                     : 32)
 
 /** L1 kernel (CORE): all pointers are L1 addresses. */
 extern void l1_softmax_rows_fp16_spatz(uint32_t x, uint32_t p0, uint32_t p1);

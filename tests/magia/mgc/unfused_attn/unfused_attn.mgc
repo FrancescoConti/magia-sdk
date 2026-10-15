@@ -20,7 +20,8 @@ o_gold = l2("o_gold",  (S, P), fp16)  # golden
 WAIT_MODE = define(WFE)
 QK_TIMESLOTS = define(2)   # over P
 PV_TIMESLOTS = define(8)   # over S
-SM_CHUNK = define(32)      # rows of attn per Spatz call
+# rows of attn per Spatz call: 32, or all the rows of the tile on larger meshes
+SM_CHUNK = define("(SEQ_LENGTH / (MESH_X_TILES * MESH_Y_TILES) < 32 ? SEQ_LENGTH / (MESH_X_TILES * MESH_Y_TILES) : 32)")
 
 # Implemented in src/kernels.c, synchronous on the tile's CV32 core:
 # x[r, :] = softmax(x[r, :] / sqrt(PROJ_SIZE)) in place on Spatz (scale folded into the exp).

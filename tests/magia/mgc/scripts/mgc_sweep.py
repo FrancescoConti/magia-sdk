@@ -189,6 +189,13 @@ class Test:
                 return 'S_BLOCK_SIZE_Q and S_BLOCK_SIZE_KV must be multiples of tiles'
             if S // bq > 255 or S // bkv > 255:
                 return 'more than 255 blocks'
+        if self.kind == 'unfused_attn':
+            # softmax: S / tiles^2 rows per tile, in chunks of SM_CHUNK = min(32, rows)
+            S, P, n = cfg['S'], cfg['P'], tiles * tiles
+            if S % tiles or P % tiles:
+                return 'S and P must be multiples of tiles'
+            if S % n or (S // n > 32 and S // n % 32):
+                return 'S / tiles^2 (softmax rows per tile) must be an integer, <= 32 or a multiple of 32'
         return None
 
     def needs_regen(self, cfg, tiles):
