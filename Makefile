@@ -238,9 +238,7 @@ run: set_mesh $(GVSOC_WORK_DIR)
 ifndef test
 	$(error Proper formatting is: make run test=<test_name> platform=rtl|verilator|gvsoc)
 endif
-ifeq (,$(wildcard $(CMAKE_BUILDDIR)/bin/$(test)))
-	$(error No test found with name: $(test))
-endif
+	@test -f "$(CMAKE_BUILDDIR)/bin/$(test)" || { echo "error: No test found with name: $(test)" >&2; exit 1; }
 ifndef platform
 	$(error Proper formatting is: make run test=<test_name> platform=rtl|verilator|gvsoc)
 endif
@@ -289,9 +287,7 @@ run_profiling: set_mesh $(GVSOC_WORK_DIR) $(GVSOC2PERFETTO_BIN)
 ifndef test
 	$(error Proper formatting is: make run_profiling test=<test_name>)
 endif
-ifeq (,$(wildcard $(CMAKE_BUILDDIR)/bin/$(test)))
-	$(error No test found with name: $(test))
-endif
+	@test -f "$(CMAKE_BUILDDIR)/bin/$(test)" || { echo "error: No test found with name: $(test)" >&2; exit 1; }
 	$(GVRUN) --target=$(GVRUN_TARGET) --param binary=$(BIN_ABS_PATH)/$(test) $(GVRUN_PROFILE_ARGS) $(PROFILE_TILE_ARG) $(GVSOC_TRACE_ARG)
 	$(GVSOC2PERFETTO_BIN) $(GVSOC2PERFETTO_VCD) \
 		-o $(GVSOC2PERFETTO_OUT) \

@@ -4,14 +4,14 @@
 #
 # Francesco Conti <francesco.conti@chips.it>
 #
-# Golden data for mgc_flat_attn_naive:
+# Golden data for flat_attn_naive:
 #   python tests/magia/mesh/mm_generator/flat_attn.py --tiles 2 4 8 16 \
-#       --inc_dir tests/magia/mesh/mgc_flat_attn_naive/include
+#       --inc_dir tests/magia/mgc/flat_attn_naive/include
 
 # COMPUTE:
 # O[s_size, p_size] = softmax( Q[s_size, p_size] @ Kt[p_size, s_size] / sqrt(p_size) ) @ V[s_size, p_size]
 #
-# The golden is a bit-true FP16 model of the FlatAttention dataflow of mgc_flat_attn_naive.mgc
+# The golden is a bit-true FP16 model of the FlatAttention dataflow of flat_attn_naive.mgc
 # (online softmax over K/V blocks, each split over the mesh columns), with the RedMulE matmuls
 # and the Spatz kernels (Schraudolph exp, sequential reductions) emulated op by op.
 # Rows are independent, so the mesh rows and the Q blocking do not change the numerics.
