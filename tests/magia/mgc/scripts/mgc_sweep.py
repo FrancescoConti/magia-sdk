@@ -7,12 +7,15 @@
 """mgc_sweep - run the tests in tests/magia/mgc over a sweep of configurations on gvsoc and
 compare cycles, MAC/cycle and the utilization of RedMulE, iDMA and Spatz.
 
-Each configuration is built and run, one at a time, with
+The runs are ordered by mesh side; gvsoc is rebuilt for each mesh side with
+    make gvsoc tiles=<N> pulp_cluster=0
+and each configuration is built and run, one at a time, with
     make clean build run_profiling platform=gvsoc tiles=<N> test=<test> pulp_cluster=0
 and measured on gvsoc_work/trace.perfetto-trace:
   - cycles: from tile 0's entry in main to the exit of the last tile other than tile 0, i.e.
     without crt0 init and without tile 0's final check()
-  - MAC/cycle: matmul MACs only (2*H*S*S*P for attention, softmax counts 0) / cycles
+  - MAC/cycle: matmul MACs only / cycles: M*N*K*N_ITERATIONS for mm, 2*S*S*P for attention
+    (Q @ Kt and Attn @ V of one head, softmax counts 0)
   - per-tile utilization in that window, averaged over all tiles: RedMulE busy, iDMA backend
     busy (L2->L1, L1->L2, either), Spatz running a task or its VFU active, and empty cycles
     (none of them busy: CV32 alone, or CV32 asleep waiting for an event)
@@ -35,7 +38,8 @@ or a single group from the command line:
 
 Output in --out: summary.log (human-readable table), results.csv (one row per run, plain
 comma-separated numbers, empty for N/A: Excel, or numpy.genfromtxt(f, delimiter=',',
-names=True, dtype=None, encoding='utf-8')), runs/<id>/ (make log, per-tile metrics).
+names=True, dtype=None, encoding='utf-8')), gvsoc_tiles<N>.log (gvsoc builds), runs/<id>/ (make
+log, per-tile metrics).
 
 Needs the `perfetto` Python package (pip install perfetto); the golden generators need torch
 (--gen-python), mgcc needs xDSL (mgc/.venv, see mgc/README.md).
@@ -152,8 +156,8 @@ class Test:
         if self.kind == 'mm':
             k = self.mnk
             return k['M_SIZE'] * k['N_SIZE'] * k['K_SIZE'] * k['N_ITERATIONS']
-        # Q @ Kt and attn @ V, one head per H
-        return 2 * (cfg['H'] or 1) * cfg['S'] * cfg['S'] * cfg['P']
+        # Q @ Kt and Attn @ V, S*S*P each; the kernels compute a single head (H is not used)
+        return 2 * cfg['S'] * cfg['S'] * cfg['P']
 
     def check(self, cfg, tiles):
         """Reason why (cfg, tiles) cannot run, or None."""
@@ -270,13 +274,24 @@ def generate(test, cfg, tiles, args, srcs, log):
 # Build + run
 # --------------------------------------------------------------------------------------------
 
+def make(cmd):
+    env_setup = 'source sourceme.sh && ' if os.path.exists(os.path.join(REPO, 'sourceme.sh')) else ''
+    return subprocess.run(['bash', '-c', env_setup + cmd], cwd=REPO, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, text=True, errors='replace')
+
+
+def build_gvsoc(tiles, logf):
+    """gvsoc is built for one mesh side: rebuild it whenever tiles changes."""
+    cmd = 'make gvsoc tiles=%d pulp_cluster=0' % tiles
+    r = make(cmd)
+    write(logf, '$ ' + cmd + '\n' + r.stdout)
+    return r.returncode
+
+
 def run_make(test, tiles, logf):
     cmd = 'make clean build run_profiling platform=gvsoc tiles=%d test=%s pulp_cluster=0' % (tiles, test.target)
-    env_setup = 'source sourceme.sh && ' if os.path.exists(os.path.join(REPO, 'sourceme.sh')) else ''
-    out = ''
     for _ in range(2):
-        r = subprocess.run(['bash', '-c', env_setup + cmd], cwd=REPO, stdout=subprocess.PIPE,
-                           stderr=subprocess.STDOUT, text=True, errors='replace')
+        r = make(cmd)
         out = r.stdout
         # a fresh build dir can fail the binary check: rerun once the binary exists
         if 'No test found' not in out:
@@ -480,8 +495,9 @@ def expand(groups, tests):
                     if key not in seen:
                         seen.add(key)
                         runs.append((t, cfg, tiles))
-    # tests and parameters together, so the sources change as little as possible
-    runs.sort(key=lambda r: (r[0].name, [r[1][p] or 0 for p in PARAMS], r[2]))
+    # mesh side outermost, so gvsoc is rebuilt once per side; then tests and parameters together,
+    # so the sources change as little as possible
+    runs.sort(key=lambda r: (r[2], r[0].name, [r[1][p] or 0 for p in PARAMS]))
     return runs
 
 
@@ -542,6 +558,7 @@ def main():
     rep.log('mgc sweep: %d configurations, output in %s' % (len(runs), out))
 
     rows = []
+    gvsoc_tiles, gvsoc_rc = None, 0  # mesh side gvsoc is built for, and its build's return code
     try:
         for i, (t, cfg, tiles) in enumerate(runs):
             rid = '%03d' % i
@@ -557,9 +574,16 @@ def main():
             elif why is None:
                 for p in list(srcs.saved):  # back to the committed sources
                     shutil.copy2(srcs.saved[p], p)
+            if why is None and tiles != gvsoc_tiles:
+                rep.log('  building gvsoc for tiles=%d...' % tiles)
+                gvsoc_tiles = tiles
+                gvsoc_rc = build_gvsoc(tiles, os.path.join(out, 'gvsoc_tiles%d.log' % tiles))
             if why:
                 row['status'] = 'SKIP'
                 rep.log('  skipped: ' + why)
+            elif gvsoc_rc:
+                row['status'] = 'GVSOC FAIL'
+                rep.log('  gvsoc build failed (rc=%d), see %s' % (gvsoc_rc, os.path.join(out, 'gvsoc_tiles%d.log' % tiles)))
             else:
                 rc, outp = run_make(t, tiles, os.path.join(rdir, 'make.log'))
                 kills, errs = parse_run(outp)
