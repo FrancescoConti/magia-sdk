@@ -393,6 +393,10 @@ MATMUL and the others accumulate onto it; inside a further loop, the prologue ch
 two at run time (`if (z == 0)`). Buffers written by other tiles (`buf.at_rel(...)` stores) are
 never switched.
 
+`redmule.enqueue(x, w, y, op=GEMM, uninit=cond)` makes the choice explicit, when the compiler cannot
+see it: the job is a MATMUL in the iterations where `cond` holds (e.g. `uninit=i % n == 0`, the
+first block of an accumulation flattened into a longer pipeline).
+
 #### `sync()` inside stages
 
 `sync()` statements inside the blocks of a `pipeline()` are kept where they are written. This is

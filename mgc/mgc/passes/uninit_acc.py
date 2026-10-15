@@ -137,8 +137,8 @@ class UninitAcc(ModulePass):
 
         for op in list(module.walk()):
             j = _job(op)
-            if j is None:
-                continue
+            if j is None or getattr(op, 'alt', None) is not None:
+                continue  # `uninit=` given by the user
             acc, job = j
             alt = devices.HWPES[acc].jobs[job].if_uninit
             if not alt:

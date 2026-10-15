@@ -1040,6 +1040,7 @@ class Frontend:
           returns its event;
         - `redmule.enqueue(x, w, y, op=GEMM, event=ev[k])`: program a job without
           starting it; `op=` names the job (required if the jobs declare one);
+          `uninit=cond` runs the job's `if_uninit` alternative when `cond` holds;
         - `redmule.commit()` / `.start()` / `.commit_start()`: explicit queue control.
         """
         dev = devices.HWPES[acc]
@@ -1051,11 +1052,19 @@ class Frontend:
             return None
         if fn == 'enqueue':
             job, c = self._enqueue_op(c, acc, dev)
+            attrs = {}
+            uninit = [k for k in c.keywords if k.arg == 'uninit']
+            if uninit:
+                if not dev.jobs[job].if_uninit:
+                    raise MgcError(c, f'`uninit=`: {acc} job `{job}` has no alternative without accumulator')
+                attrs = {'alt': StringAttr(dev.jobs[job].if_uninit), 'alt_if': ir.E(self.cond(uninit[0].value))}
+                c = ast.copy_location(ast.Call(func=c.func, args=c.args,
+                                               keywords=[k for k in c.keywords if k.arg != 'uninit']), c)
             ev = self._event_kw(c, acc)
             bufs, slots = self._job_operands(c, s)
             self.add(ir.HwpeOp.create(operands=bufs, attributes={
                 'acc': StringAttr(acc), 'job': StringAttr(job), 'action': StringAttr('enqueue'),
-                'slots': ir.exprs(slots), 'event': ir.EvtAttr(ev)}), s)
+                'slots': ir.exprs(slots), 'event': ir.EvtAttr(ev), **attrs}), s)
             return ir.EvtRef(ev.kind, ev.name, index=ev.index)
         if fn in dev.jobs:
             ev = self._event_kw(c, acc)
