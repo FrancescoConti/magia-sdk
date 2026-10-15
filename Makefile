@@ -288,7 +288,10 @@ ifndef test
 	$(error Proper formatting is: make run_profiling test=<test_name>)
 endif
 	@test -f "$(CMAKE_BUILDDIR)/bin/$(test)" || { echo "error: No test found with name: $(test)" >&2; exit 1; }
-	$(GVRUN) --target=$(GVRUN_TARGET) --param binary=$(BIN_ABS_PATH)/$(test) $(GVRUN_PROFILE_ARGS) $(PROFILE_TILE_ARG) $(GVSOC_TRACE_ARG)
+# The VCD is streamed through a FIFO into the converter, so it never lands on disk (it can
+# reach tens of GB). `: <>` releases the converter if gvsoc died before opening the FIFO. The
+# converter's output is printed after gvsoc's, not interleaved with it.
+	rm -f -- $(GVSOC2PERFETTO_VCD) && mkfifo $(GVSOC2PERFETTO_VCD)
 	$(GVSOC2PERFETTO_BIN) $(GVSOC2PERFETTO_VCD) \
 		-o $(GVSOC2PERFETTO_OUT) \
 		--state-map 'fsm_state=0:idle,1:preload,2:routine,3:storing,4:finished,5:acknowledge' \
@@ -298,8 +301,10 @@ endif
 		--split-asm \
 		--symbolize $(CMAKE_BUILDDIR)/bin/$(test).s \
 		--stats \
-		--include '$(GVSOC2PERFETTO_INCLUDE)'
-	rm -f -- $(GVSOC2PERFETTO_VCD)
+		--include '$(GVSOC2PERFETTO_INCLUDE)' > $(GVSOC_WORK_DIR)/gvsoc2perfetto.log 2>&1 & conv=$$!; \
+	$(GVRUN) --target=$(GVRUN_TARGET) --param binary=$(BIN_ABS_PATH)/$(test) $(GVRUN_PROFILE_ARGS) $(PROFILE_TILE_ARG) $(GVSOC_TRACE_ARG); \
+	rc=$$?; : <> $(GVSOC2PERFETTO_VCD); wait $$conv && [ $$rc -eq 0 ]; rc=$$?; \
+	cat $(GVSOC_WORK_DIR)/gvsoc2perfetto.log; rm -f -- $(GVSOC2PERFETTO_VCD); exit $$rc
 
 .PHONY: debug_profiling
 debug_profiling: $(GVSOC_WORK_DIR) $(GVSOC2PERFETTO_BIN)

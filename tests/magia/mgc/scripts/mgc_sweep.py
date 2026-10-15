@@ -38,6 +38,10 @@ parameters take each test's default), e.g.
 or a single group from the command line:
     tests/magia/mgc/scripts/mgc_sweep.py --tests unfused_attn flat_attn_pipeopt3 --tiles 2 4 [--S 512 1024 ...]
     tests/magia/mgc/scripts/mgc_sweep.py --sweep sweep.json [--out DIR] [--jobs J] [--dry-run] [--keep-traces]
+                                         [--no-profile] [--timeout SEC]
+--no-profile runs make run instead of make run_profiling: much faster, cycles and MAC/cycle only
+(tile 0's entry in main comes from its PC, streamed through a FIFO). --timeout kills a simulation
+that does not end (status TIMEOUT).
     tests/magia/mgc/scripts/mgc_sweep.py --list
 
 Output in --out: summary.log (human-readable table), results.csv (one row per run, plain
@@ -81,12 +85,15 @@ HEADER_DEFINES = {'S': 'SEQ_LENGTH', 'D': 'EMBED_SIZE', 'P': 'PROJ_SIZE', 'H': '
 MGC_DEFINES = ['S_BLOCK_SIZE_Q', 'S_BLOCK_SIZE_KV']
 # Only the gvsoc events analyze() reads (make's defaults dump ~20x more: asm, NoC, L2, ...),
 # as POSIX basic regexes for gvsoc and as a regex of the gvsoc2perfetto tracks they become
-PROFILE_EVENTS = ["'/tile-[0-9]*-%s$$'" % e for e in (
-    'cv32-core/busy', 'cv32-core/active_pc', 'redmule/busy', 'idma-[a-z0-9]*/be/busy',
-    'snitch-spatz/active_pc', 'snitch-spatz/ara/active')]
+# (CV32 PC of tile 0 only, for its entry in main: one change per cycle of a spinning core)
+PROFILE_EVENTS = ["'/tile-0-cv32-core/active_pc$$'"] + ["'/tile-[0-9]*-%s$$'" % e for e in (
+    'cv32-core/busy', 'redmule/busy', 'idma-[a-z0-9]*/be/busy', 'snitch-spatz/active_pc',
+    'snitch-spatz/ara/active')]
 PERFETTO_INCLUDE = (r'(?x) tile-\d+-cv32-core\.(busy|active_pc)$$ | tile-\d+-redmule\.busy$$'
                     r' | tile-\d+-idma-(axi2obi|obi2axi)\.be\.busy$$'
                     r' | tile-\d+-snitch-spatz\.(active_pc|ara\.active)$$')
+# --no-profile: the only event dumped, to find tile 0's entry in main
+MAIN_EVENT = "'/tile-0-cv32-core/active_pc$$'"
 # Spatz runtime outside of any task (boot, dispatcher, interrupt handling)
 SPATZ_IDLE_FUNCS = {'_start', 'dispatcher_loop', '_trap_handler', '_handle_exception',
                     '_handle_interrupt', '_trap_ret'}
@@ -301,20 +308,24 @@ PROCS = set()  # running make process groups, killed on interrupt
 STOP = threading.Event()
 
 
-def make(cmd):
-    """Run cmd in its own process group; return (return code, output)."""
+def make(cmd, timeout=None):
+    """Run cmd in its own process group; return (return code, output), return code None if
+    killed after timeout seconds."""
     env_setup = 'source sourceme.sh && ' if os.path.exists(os.path.join(REPO, 'sourceme.sh')) else ''
     p = subprocess.Popen(['bash', '-c', env_setup + cmd], cwd=REPO, stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT, text=True, errors='replace', start_new_session=True)
     PROCS.add(p)
     try:
-        out = p.communicate()[0]
+        out = p.communicate(timeout=timeout)[0]
+        return p.returncode, out
+    except subprocess.TimeoutExpired:
+        kill(p)
+        return None, p.communicate()[0]
     except BaseException:
         kill(p)
         raise
     finally:
         PROCS.discard(p)
-    return p.returncode, out
 
 
 def kill(p):
@@ -349,16 +360,57 @@ def build_test(test, tiles, build, logf):
     return rc
 
 
-def run_test(test, tiles, build, work, logf, full_trace):
-    cmd = ('make run_profiling platform=gvsoc tiles=%d test=%s pulp_cluster=0 CMAKE_BUILDDIR=%s '
-           'GVSOC_WORK_DIR=%s' % (tiles, test.target, build, work))
-    if not full_trace:
+def run_test(test, tiles, build, work, logf, args):
+    cmd = ('make %s platform=gvsoc tiles=%d test=%s pulp_cluster=0 CMAKE_BUILDDIR=%s GVSOC_WORK_DIR=%s'
+           % ('run' if args.no_profile else 'run_profiling', tiles, test.target, build, work))
+    if args.no_profile:
+        cmd += ' ' + shlex.quote('GVRUN_ARGS=$(GVRUN_COMMON_ARGS) --vcd --event=' + MAIN_EVENT + ' run')
+    elif not args.keep_traces:
         cmd += ' ' + shlex.quote('profile_events=' + ' '.join(PROFILE_EVENTS))
         cmd += ' ' + shlex.quote('GVSOC2PERFETTO_INCLUDE=' + PERFETTO_INCLUDE)
-    rc, out = make(cmd)
+    rc, out = make(cmd, args.timeout)
     with open(logf, 'a') as f:
         f.write('$ ' + cmd + '\n' + out)
     return rc, out
+
+
+class MainStart(threading.Thread):
+    """--no-profile: drains gvsoc's VCD (tile 0's CV32 PC only) from a FIFO in the work dir,
+    so it never hits the disk, and notes when tile 0 enters main."""
+
+    def __init__(self, work, main_addr):
+        super().__init__(daemon=True)
+        os.makedirs(work, exist_ok=True)
+        self.fifo = os.path.join(work, 'all.vcd')
+        if os.path.lexists(self.fifo):
+            os.remove(self.fifo)
+        os.mkfifo(self.fifo)
+        self.value = b'b%s' % format(main_addr, '032b').encode()
+        self.ps = None
+        self.start()
+
+    def run(self):
+        with open(self.fifo, 'rb') as f:
+            t = 0
+            for line in f:
+                if line[:1] == b'#':
+                    t = int(line[1:])
+                elif line.split(b' ', 1)[0] == self.value:
+                    self.ps = t
+                    break
+            while f.read(1 << 20):
+                pass
+
+    def finish(self):
+        """Cycle of tile 0's entry in main, or None."""
+        if self.is_alive():  # gvsoc never opened the VCD: release the blocked reader
+            try:
+                os.close(os.open(self.fifo, os.O_WRONLY | os.O_NONBLOCK))
+            except OSError:
+                pass
+        self.join()
+        os.remove(self.fifo)
+        return None if self.ps is None else self.ps // (1000 * CYCLE_NS)
 
 
 def parse_run(out):
@@ -407,13 +459,18 @@ def overlap(a, b):
     return int(t)
 
 
-def spatz_idle_pcs(test, build):
-    """Absolute [lo, hi) PC ranges of the Spatz runtime outside tasks, and the binary's range."""
+def symbols(test, build):
+    """Symbol -> address of the test's binary."""
     m = re.search(r'^CMAKE_NM:FILEPATH=(.+)$', read(os.path.join(build, 'CMakeCache.txt')), re.M)
     nm = m.group(1) if m else 'riscv64-unknown-elf-nm'
     syms = subprocess.run([nm, os.path.join(build, 'bin', test.target)], capture_output=True,
                           text=True).stdout
-    addr = {m.group(2): int(m.group(1), 16) for m in re.finditer(r'^([0-9a-f]+) \w (\w+)$', syms, re.M)}
+    return {m.group(2): int(m.group(1), 16) for m in re.finditer(r'^([0-9a-f]+) \w (\w+)$', syms, re.M)}
+
+
+def spatz_idle_pcs(test, build):
+    """Absolute [lo, hi) PC ranges of the Spatz runtime outside tasks, and the binary's range."""
+    addr = symbols(test, build)
     base, end = addr['_spatz_binary_start'], addr['_spatz_binary_end']
     dump = glob.glob(os.path.join(build, 'bin', 'magia', test.spatz_name, 'spatz_task', '*.dump'))[0]
     funcs, in_text = [], False
@@ -585,37 +642,56 @@ def expand(groups, tests):
 def simulate(t, cfg, tiles, row, rdir, slot, build, work, t0, tag, args, rep, free):
     """Run a built configuration in job slot `slot`, measure it and add its row."""
     try:
-        rc, outp = run_test(t, tiles, build, work, os.path.join(rdir, 'make.log'), args.keep_traces)
+        watch = MainStart(work, symbols(t, build)['main']) if args.no_profile else None
+        try:
+            rc, outp = run_test(t, tiles, build, work, os.path.join(rdir, 'make.log'), args)
+        finally:
+            main_start = watch and watch.finish()
         if STOP.is_set():
             return
         kills, errs = parse_run(outp)
         row['sim_seconds'] = round(time.time() - t0, 1)
         row['errors'] = sum(errs) if errs else None
-        if rc or len(kills) != tiles * tiles:
+        if rc is None:
+            row['status'] = 'TIMEOUT'
+            rep.log('%s TIMEOUT after %ds (%d/%d tiles exited), see %s' % (tag, args.timeout, len(kills),
+                                                                          tiles * tiles, rdir))
+        elif rc or len(kills) != tiles * tiles:
             row['status'] = 'BUILD/RUN FAIL' if rc else 'NO EXIT'
             rep.log('%s %s (rc=%d, %d/%d tiles exited), see %s' % (tag, row['status'], rc, len(kills),
                                                                  tiles * tiles, rdir))
         else:
             row['status'] = 'PASS' if errs and sum(errs) == 0 else 'FAIL'
-            trace = os.path.join(work, 'trace.perfetto-trace')
-            lo, hi, per_tile = analyze(t, trace, kills, tiles * tiles, build)
-            cyc = hi - lo
-            macs = t.macs(cfg)
-            mean = {k: 100 * np.mean([pt[k] for pt in per_tile]) for k in per_tile[0]}
-            row.update(cycles=cyc, macs=macs, mac_per_cycle=macs / cyc,
-                       mac_per_cycle_per_tile=macs / cyc / (tiles * tiles),
-                       redmule_pct=mean['redmule'], idma_pct=mean['idma'], idma_in_pct=mean['idma_in'],
-                       idma_out_pct=mean['idma_out'], spatz_pct=mean['spatz'], spatz_vfu_pct=mean['vfu'],
-                       empty_pct=mean['empty'], empty_cv32_active_pct=mean['cv32_active'],
-                       empty_cv32_sleep_pct=mean['cv32_sleep'], main_start_cycle=lo, end_cycle=hi)
-            with open(os.path.join(rdir, 'per_tile.txt'), 'w') as f:
-                f.write('tile ' + ' '.join('%11s' % k for k in per_tile[0]) + '   (%)\n')
-                for k, pt in enumerate(per_tile):
-                    f.write('%4d ' % k + ' '.join('%11.1f' % (100 * v) for v in pt.values()) + '\n')
-            rep.log('%s %s: %s cycles, %.1f MAC/cycle, RedMulE %.1f%%, iDMA %.1f%%, Spatz %.1f%%, '
-                    'empty %.1f%% (%.1fs)' % (tag, row['status'], format(cyc, ','), macs / cyc,
-                                              mean['redmule'], mean['idma'], mean['spatz'],
-                                              mean['empty'], time.time() - t0))
+            if args.no_profile:  # no utilization
+                if main_start is None:
+                    raise RuntimeError('tile 0 never entered main in the VCD')
+                hi = max([c for k, c in kills.items() if k != 0] or kills.values())
+                cyc, macs = hi - main_start, t.macs(cfg)
+                row.update(cycles=cyc, macs=macs, mac_per_cycle=macs / cyc,
+                           mac_per_cycle_per_tile=macs / cyc / (tiles * tiles),
+                           main_start_cycle=main_start, end_cycle=hi)
+                rep.log('%s %s: %s cycles, %.1f MAC/cycle (%.1fs)' % (tag, row['status'], format(cyc, ','),
+                                                                      macs / cyc, time.time() - t0))
+            else:
+                trace = os.path.join(work, 'trace.perfetto-trace')
+                lo, hi, per_tile = analyze(t, trace, kills, tiles * tiles, build)
+                cyc = hi - lo
+                macs = t.macs(cfg)
+                mean = {k: 100 * np.mean([pt[k] for pt in per_tile]) for k in per_tile[0]}
+                row.update(cycles=cyc, macs=macs, mac_per_cycle=macs / cyc,
+                           mac_per_cycle_per_tile=macs / cyc / (tiles * tiles),
+                           redmule_pct=mean['redmule'], idma_pct=mean['idma'], idma_in_pct=mean['idma_in'],
+                           idma_out_pct=mean['idma_out'], spatz_pct=mean['spatz'], spatz_vfu_pct=mean['vfu'],
+                           empty_pct=mean['empty'], empty_cv32_active_pct=mean['cv32_active'],
+                           empty_cv32_sleep_pct=mean['cv32_sleep'], main_start_cycle=lo, end_cycle=hi)
+                with open(os.path.join(rdir, 'per_tile.txt'), 'w') as f:
+                    f.write('tile ' + ' '.join('%11s' % k for k in per_tile[0]) + '   (%)\n')
+                    for k, pt in enumerate(per_tile):
+                        f.write('%4d ' % k + ' '.join('%11.1f' % (100 * v) for v in pt.values()) + '\n')
+                rep.log('%s %s: %s cycles, %.1f MAC/cycle, RedMulE %.1f%%, iDMA %.1f%%, Spatz %.1f%%, '
+                        'empty %.1f%% (%.1fs)' % (tag, row['status'], format(cyc, ','), macs / cyc,
+                                                  mean['redmule'], mean['idma'], mean['spatz'],
+                                                  mean['empty'], time.time() - t0))
     except Exception as e:
         if STOP.is_set():
             return
@@ -656,6 +732,10 @@ def main():
     ap.add_argument('--keep-traces', action='store_true',
                     help='keep each run\'s perfetto trace, with all of make\'s profile events (default: '
                          'only the events the sweep measures, trace deleted after the analysis)')
+    ap.add_argument('--no-profile', action='store_true',
+                    help='make run instead of make run_profiling: cycles and MAC/cycle only, no utilization '
+                         '(only tile 0\'s PC is dumped, through a FIFO, to find its entry in main)')
+    ap.add_argument('--timeout', type=int, help='kill a simulation after this many seconds (status TIMEOUT)')
     ap.add_argument('--dry-run', action='store_true', help='only list the configurations')
     ap.add_argument('--list', action='store_true', help='list the tests and their default parameters')
     args = ap.parse_args()
