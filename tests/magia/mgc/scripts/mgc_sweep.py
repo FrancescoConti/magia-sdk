@@ -427,7 +427,7 @@ def analyze(test, trace, kills, n_tiles, build):
     try:
         tracks = {}  # (tile, track name) -> track id
         for r in tp.query("select t.id, t.name, p.name pname from track t join track p on t.parent_id = p.id "
-                          "where p.name like 'magia-tile %'"):
+                          "where p.name like '%magia-tile %'"):  # 'magia-v3-soc.magia-tile N' if only tile events
             tracks[(int(r.pname.split()[-1]), r.name)] = r.id
 
         def slices(tile, name):
