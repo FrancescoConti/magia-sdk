@@ -155,21 +155,44 @@ def main():
                 s_start_kv: u16 = (it % s_block_nb_kv) * s_block_size_kv + tiles_j.start
 
                 # load Q (every iteration: the next Q block is loaded while the previous one is still used), K
-                # and V, and multicast them along the row / column (serialized push); each tile has size
-                # [Stile x D] (transposed for Kt)
+                # and V on the first column / first row / last row of tiles, so that the three multicasts start
+                # from different tiles; each tile has size [Stile x D] (transposed for Kt)
                 if jj==0:
                     eq = idma.load(q[it], q_[s_start_q:s_start_q + tiles_i.size, :])
                 if ii==0:
                     ekt = idma.load(kt[it], kt_[:, s_start_kv:s_start_kv + tiles_j.size])
+                if ii==MESH_Y_TILES - 1:
+                    ev = idma.load(v[it], v_[s_start_kv:s_start_kv + tiles_j.size, :])
                 if jj==0:
                     eq.wait()
-                    eq_mc = idma.store(q.row[it], q[it])
                 if ii==0:
                     ekt.wait()
-                    ev = idma.load(v[it], v_[s_start_kv:s_start_kv + tiles_j.size, :])
-                    ekt_mc = idma.store(kt.col[it], kt[it])
+                if ii==MESH_Y_TILES - 1:
                     ev.wait()
-                    ev_mc = idma.store(v.col[it], v[it])
+
+                # multicast them by binary trees (recursive doubling): Q along the rows from the first column, Kt
+                # down the columns from the first row, V up the columns from the last row. At each level, every
+                # tile that already holds the block pushes it to the tile `stride` further away, so a block
+                # reaches all the MESH_X_TILES tiles in log2(MESH_X_TILES) levels of a single transfer per tile
+                # instead of MESH_X_TILES - 1 serialized pushes from the source (square, power-of-two mesh)
+                dv: u8 = MESH_Y_TILES - 1 - ii
+                stride_mc: u8 = MESH_X_TILES // 2
+                for lvl_mc in range(MESH_X_TILES):
+                    if stride_mc > 0:
+                        if jj % (2 * stride_mc) == 0:
+                            eq_mc = idma.store(q.at(ii, jj + stride_mc)[it], q[it])
+                        if ii % (2 * stride_mc) == 0:
+                            ekt_mc = idma.store(kt.at(ii + stride_mc, jj)[it], kt[it])
+                        if dv % (2 * stride_mc) == 0:
+                            ev_mc = idma.store(v.at(ii - stride_mc, jj)[it], v[it])
+                        if jj % (2 * stride_mc) == 0:
+                            eq_mc.wait()
+                        if ii % (2 * stride_mc) == 0:
+                            ekt_mc.wait()
+                        if dv % (2 * stride_mc) == 0:
+                            ev_mc.wait()
+                        sync(GLOBAL)
+                        stride_mc = stride_mc // 2
 
             with stage(2):
                 spatz_expminus_rowsum_wait(attn[it], row_sum[it])
@@ -215,13 +238,6 @@ def main():
 
             with stage(1):
                 jqk.wait()
-
-            with stage(0):
-                if jj==0:
-                    eq_mc.wait()
-                if ii==0:
-                    ekt_mc.wait()
-                    ev_mc.wait()
 
         # check the whole output on tile (0, 0), once every tile of the first column has written its slices
         sync(GLOBAL)
