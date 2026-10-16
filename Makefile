@@ -407,7 +407,7 @@ gvsoc_init:
 	git fetch origin $(GVSOC_CORE_COMMIT) && \
 	git checkout $(GVSOC_CORE_COMMIT) && \
 	cd ../pulp && \
-	git fetch origin $(GVSOC_PULP_COMMIT) && \
+	git fetch https://github.com/FrancescoConti/gvsoc-pulp.git $(GVSOC_PULP_COMMIT) && \
 	git checkout $(GVSOC_PULP_COMMIT) && \
 	cd ../engine && \
 	git fetch origin $(GVSOC_ENGINE_COMMIT) && \
