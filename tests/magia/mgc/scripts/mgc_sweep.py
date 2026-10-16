@@ -49,7 +49,9 @@ comma-separated numbers, empty for N/A: Excel, or numpy.genfromtxt(f, delimiter=
 names=True, dtype=None, encoding='utf-8')), gvsoc_tiles<N>.log (gvsoc builds), runs/<id>/ (make
 log, per-tile metrics).
 
-Needs the `perfetto` Python package (pip install perfetto); the golden generators need torch
+Needs the `perfetto` Python package (pip install perfetto; on hosts with glibc < 2.34 its
+trace_processor_shell does not run, and the sweep fetches perfetto v47.0's instead, or give one
+with --trace-processor); the golden generators need torch
 (--gen-python), mgcc needs xDSL (mgc/.venv, see mgc/README.md).
 """
 
@@ -68,6 +70,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, wait
 from queue import Queue
 
@@ -94,6 +97,13 @@ PERFETTO_INCLUDE = (r'(?x) tile-\d+-cv32-core\.(busy|active_pc)$$ | tile-\d+-red
                     r' | tile-\d+-snitch-spatz\.(active_pc|ara\.active)$$')
 # --no-profile: the only event dumped, to find tile 0's entry in main
 MAIN_EVENT = "'/tile-0-cv32-core/active_pc$$'"
+# perfetto's prebuilt trace_processor_shell needs glibc >= 2.34 since v48: on older hosts (e.g.
+# RHEL 8, glibc 2.28) the sweep fetches v47.0, the last release built against glibc 2.23
+TP_MIN_GLIBC = (2, 34)
+TP_LEGACY_URL = ('https://commondatastorage.googleapis.com/perfetto-luci-artifacts/v47.0/linux-amd64/'
+                 'trace_processor_shell')
+TP_LEGACY_BIN = os.path.join(os.path.expanduser('~'), '.local', 'share', 'perfetto', 'prebuilts',
+                             'trace_processor_shell-v47.0')
 # Spatz runtime outside of any task (boot, dispatcher, interrupt handling)
 SPATZ_IDLE_FUNCS = {'_start', 'dispatcher_loop', '_trap_handler', '_handle_exception',
                     '_handle_interrupt', '_trap_ret'}
@@ -485,9 +495,30 @@ def spatz_idle_pcs(test, build):
     return idle, (base, end)
 
 
-def analyze(test, trace, kills, n_tiles, build):
+def trace_processor_bin(path, log):
+    """trace_processor_shell for the perfetto package: path if given, None (perfetto's own
+    prebuilt) on hosts with a recent enough glibc, else TP_LEGACY_BIN (downloaded once)."""
+    if path:
+        return path
+    try:
+        glibc = tuple(int(v) for v in os.confstr('CS_GNU_LIBC_VERSION').split()[1].split('.')[:2])
+    except (ValueError, OSError, IndexError, AttributeError):
+        return None
+    if glibc >= TP_MIN_GLIBC:
+        return None
+    if not os.path.exists(TP_LEGACY_BIN):
+        log('glibc %d.%d is too old for perfetto\'s trace_processor_shell, fetching %s' % (*glibc, TP_LEGACY_URL))
+        os.makedirs(os.path.dirname(TP_LEGACY_BIN), exist_ok=True)
+        tmp = TP_LEGACY_BIN + '.part'
+        urllib.request.urlretrieve(TP_LEGACY_URL, tmp)
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, TP_LEGACY_BIN)
+    return TP_LEGACY_BIN
+
+
+def analyze(test, trace, kills, n_tiles, build, tp_bin=None):
     from perfetto.trace_processor import TraceProcessor, TraceProcessorConfig
-    tp = TraceProcessor(trace=trace, config=TraceProcessorConfig(load_timeout=1800))
+    tp = TraceProcessor(trace=trace, config=TraceProcessorConfig(bin_path=tp_bin, load_timeout=1800))
     try:
         tracks = {}  # (tile, track name) -> track id
         for r in tp.query("select t.id, t.name, p.name pname from track t join track p on t.parent_id = p.id "
@@ -624,7 +655,9 @@ def expand(groups, tests):
                 sys.exit('unknown test %r (see --list)' % name)
             t = tests[name]
             app = t.applicable()
+            # a scalar is a one-element list
             values = [g.get(p) or [t.defaults[p]] for p in app]
+            values = [v if isinstance(v, list) else [v] for v in values]
             for tiles in g['tiles']:
                 for combo in itertools.product(*values):
                     cfg = {p: None for p in PARAMS}
@@ -674,7 +707,7 @@ def simulate(t, cfg, tiles, row, rdir, slot, build, work, t0, tag, args, rep, fr
                                                                       macs / cyc, time.time() - t0))
             else:
                 trace = os.path.join(work, 'trace.perfetto-trace')
-                lo, hi, per_tile = analyze(t, trace, kills, tiles * tiles, build)
+                lo, hi, per_tile = analyze(t, trace, kills, tiles * tiles, build, args.trace_processor)
                 cyc = hi - lo
                 macs = t.macs(cfg)
                 mean = {k: 100 * np.mean([pt[k] for pt in per_tile]) for k in per_tile[0]}
@@ -736,6 +769,9 @@ def main():
                     help='make run instead of make run_profiling: cycles and MAC/cycle only, no utilization '
                          '(only tile 0\'s PC is dumped, through a FIFO, to find its entry in main)')
     ap.add_argument('--timeout', type=int, help='kill a simulation after this many seconds (status TIMEOUT)')
+    ap.add_argument('--trace-processor', metavar='BIN',
+                    help='perfetto trace_processor_shell to use (default: the perfetto package\'s own, or '
+                         'v47.0 on hosts with glibc < 2.34)')
     ap.add_argument('--dry-run', action='store_true', help='only list the configurations')
     ap.add_argument('--list', action='store_true', help='list the tests and their default parameters')
     args = ap.parse_args()
@@ -767,13 +803,17 @@ def main():
                                                   '  SKIP: ' + why if why else ''))
         return 0
 
-    out = args.out or os.path.join(SWEEP_DIR, datetime.datetime.now().strftime('%Y%m%d_%H%M%S'))
+    # absolute: the job paths under it are passed to gvrun, which runs in its work directory
+    out = os.path.abspath(args.out or os.path.join(SWEEP_DIR, datetime.datetime.now().strftime('%Y%m%d_%H%M%S')))
+    args.cache = os.path.abspath(args.cache)
     os.makedirs(os.path.join(out, 'runs'), exist_ok=True)
     rep = Report(out)
     Sources.recover(rep.log)
     srcs = Sources(rep.log)
     signal.signal(signal.SIGTERM, on_sigterm)
     rep.log('mgc sweep: %d configurations, output in %s' % (len(runs), out))
+    if not args.no_profile:
+        args.trace_processor = trace_processor_bin(args.trace_processor, rep.log)
 
     pool = ThreadPoolExecutor(args.jobs)
     free = Queue()  # job slots not running a simulation
