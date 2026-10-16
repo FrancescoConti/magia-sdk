@@ -19,7 +19,8 @@ sources. Metrics:
   - cycles: from tile 0's entry in main to the exit of the last tile other than tile 0, i.e.
     without crt0 init and without tile 0's final check()
   - MAC/cycle: matmul MACs only / cycles: M*N*K*N_ITERATIONS for mm, 2*S*S*P for attention
-    (Q @ Kt and Attn @ V of one head, softmax counts 0)
+    (Q @ Kt and Attn @ V of one head, softmax counts 0), 2*S*S*P*H + 4*S*D*P*H for mhsa (all heads,
+    plus the Q, Kt, V and output projections)
   - per-tile utilization in that window, averaged over all tiles: RedMulE busy, iDMA backend
     busy (L2->L1, L1->L2, either), Spatz running a task or its VFU active, and empty cycles
     (none of them busy: CV32 alone, or CV32 asleep waiting for an event)
@@ -158,6 +159,8 @@ class Test:
             self.mgc = sorted(glob.glob(os.path.join(self.dir, '*.mgc')))[0]
         if name.startswith('flat_attn'):
             self.kind = 'flat_attn'
+        elif name.startswith('mhsa'):
+            self.kind = 'mhsa'
         elif name == 'unfused_attn':
             self.kind = 'unfused_attn'
         else:
@@ -189,14 +192,18 @@ class Test:
         if self.kind == 'mm':
             k = self.mnk
             return k['M_SIZE'] * k['N_SIZE'] * k['K_SIZE'] * k['N_ITERATIONS']
-        # Q @ Kt and Attn @ V, S*S*P each; the kernels compute a single head (H is not used)
-        return 2 * cfg['S'] * cfg['S'] * cfg['P']
+        # Q @ Kt and Attn @ V, S*S*P each; flat_attn computes a single head (H is not used)
+        if self.kind != 'mhsa':
+            return 2 * cfg['S'] * cfg['S'] * cfg['P']
+        # mhsa: + Q, Kt, V and output projections, S*D*(H*P) each
+        S, D, P, H = cfg['S'], cfg['D'], cfg['P'], cfg['H']
+        return 2 * S * S * P * H + 4 * S * D * P * H
 
     def check(self, cfg, tiles):
         """Reason why (cfg, tiles) cannot run, or None."""
         if self.kind == 'mm' and any(cfg[p] != self.defaults[p] for p in self.applicable()):
             return 'mm tests run with their default sizes only'
-        if self.kind == 'flat_attn':
+        if self.kind in ('flat_attn', 'mhsa'):
             S, bq, bkv = cfg['S'], cfg['S_BLOCK_SIZE_Q'], cfg['S_BLOCK_SIZE_KV']
             if tiles & (tiles - 1):
                 return 'tiles must be a power of 2'
@@ -280,8 +287,9 @@ def generate(test, cfg, tiles, args, srcs, log):
         log('  generating test.h (%s)...' % key)
         os.makedirs(cache, exist_ok=True)
         env = dict(os.environ)
-        if test.kind == 'flat_attn':
-            cmd = [args.gen_python, FLAT_GEN, '--s_size', cfg['S'], '--e_size', cfg['D'],
+        if test.kind in ('flat_attn', 'mhsa'):
+            gen = FLAT_GEN if test.kind == 'flat_attn' else os.path.join(test.dir, 'gen_golden.py')
+            cmd = [args.gen_python, gen, '--s_size', cfg['S'], '--e_size', cfg['D'],
                    '--p_size', cfg['P'], '--n_heads', cfg['H'], '--block_kv', cfg['S_BLOCK_SIZE_KV'],
                    '--tiles', tiles, '--inc_dir', cache]
         else:
