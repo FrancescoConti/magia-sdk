@@ -29,12 +29,24 @@ y_gold = l2("y_gold", (S, E),    fp16)  # golden
 WAIT_MODE = define(WFE)
 S_BLOCK_SIZE_Q  = define(512)
 S_BLOCK_SIZE_KV = define(512)
+# per-tile sizes: Flat-Attention block rows/columns, projection output blocks (Q/V [PRJ_TS x PRJ_THP],
+# Kt [PRJ_TKHP x PRJ_TKS], Y [PRJ_TS x PRJ_TE])
+ATT_BR   = define("((S_BLOCK_SIZE_Q + MESH_Y_TILES - 1) / MESH_Y_TILES)")
+ATT_BC   = define("((S_BLOCK_SIZE_KV + MESH_X_TILES - 1) / MESH_X_TILES)")
+PRJ_TS   = define("((SEQ_LENGTH + MESH_Y_TILES - 1) / MESH_Y_TILES)")
+PRJ_THP  = define("((NUM_HEADS * PROJ_SIZE + MESH_X_TILES - 1) / MESH_X_TILES)")
+PRJ_TKHP = define("((NUM_HEADS * PROJ_SIZE + MESH_Y_TILES - 1) / MESH_Y_TILES)")
+PRJ_TKS  = define("((SEQ_LENGTH + MESH_X_TILES - 1) / MESH_X_TILES)")
+PRJ_TE   = define("((EMBED_SIZE + MESH_X_TILES - 1) / MESH_X_TILES)")
+# L1 bytes left to the projection buffers (which share L1) above the Flat-Attention ones: q x2, o, o_tree_recv_buf
+# [ATT_BR x P], kt x2, v x4 [P x ATT_BC], attn x3 [ATT_BR x ATT_BC], row_max x3, row_sum x2, row_gather_buf
+PRJ_L1   = define("(L1_SIZE + 1 - 2 * (4 * ATT_BR * PROJ_SIZE + 6 * PROJ_SIZE * ATT_BC + 3 * ATT_BR * ATT_BC + (5 + MESH_X_TILES) * ATT_BR))")
 # reduction block of the projections (output-static, one RedMulE job per block): over EMBED_SIZE for Q/Kt/V,
-# over NUM_HEADS * PROJ_SIZE for the output projection; the largest of 256/128/64 that divides it. For Q/V,
-# 256 only up to 256 columns of Q/V per tile: the double-buffered Wq, Wv blocks would not fit L1 beyond
-# (e.g. ViT-H on a 4x4 mesh)
-PROJ_KB_E  = define("(EMBED_SIZE % 256 == 0 && NUM_HEADS * PROJ_SIZE <= 256 * MESH_X_TILES ? 256 : EMBED_SIZE % 128 == 0 ? 128 : 64)")
-PROJ_KB_HP = define("((NUM_HEADS * PROJ_SIZE) % 256 == 0 ? 256 : (NUM_HEADS * PROJ_SIZE) % 128 == 0 ? 128 : 64)")
+# over NUM_HEADS * PROJ_SIZE for the output projection; the largest of 256/128/64 that divides it and whose
+# buffers (double-buffered input blocks, resident output block) fit PRJ_L1 (64 is not checked: the output
+# blocks alone may not fit, e.g. Llama-70B on a 4x4 mesh)
+PROJ_KB_E  = define("(EMBED_SIZE % 256 == 0 && 2 * (2 * PRJ_TS * 256 + 4 * 256 * PRJ_THP + 2 * PRJ_TS * PRJ_THP) <= PRJ_L1 && 2 * (2 * PRJ_TKHP * 256 + 2 * 256 * PRJ_TKS + PRJ_TKHP * PRJ_TKS) <= PRJ_L1 ? 256 : EMBED_SIZE % 128 == 0 && 2 * (2 * PRJ_TS * 128 + 4 * 128 * PRJ_THP + 2 * PRJ_TS * PRJ_THP) <= PRJ_L1 && 2 * (2 * PRJ_TKHP * 128 + 2 * 128 * PRJ_TKS + PRJ_TKHP * PRJ_TKS) <= PRJ_L1 ? 128 : 64)")
+PROJ_KB_HP = define("((NUM_HEADS * PROJ_SIZE) % 256 == 0 && 2 * (2 * PRJ_TS * 256 + 2 * 256 * PRJ_TE + PRJ_TS * PRJ_TE) <= PRJ_L1 ? 256 : (NUM_HEADS * PROJ_SIZE) % 128 == 0 && 2 * (2 * PRJ_TS * 128 + 2 * 128 * PRJ_TE + PRJ_TS * PRJ_TE) <= PRJ_L1 ? 128 : 64)")
 
 # Implemented in src/kernels.c, synchronous on the tile's CV32 core.
 # Merged Spatz kernels from kernels/ (the softmax scale 1/sqrt(PROJ_SIZE) is folded into the exp):

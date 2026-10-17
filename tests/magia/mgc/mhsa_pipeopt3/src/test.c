@@ -18,12 +18,35 @@
 #define WAIT_MODE       WFE
 #define S_BLOCK_SIZE_Q  512
 #define S_BLOCK_SIZE_KV 512
+#define ATT_BR          ((S_BLOCK_SIZE_Q + MESH_Y_TILES - 1) / MESH_Y_TILES)
+#define ATT_BC          ((S_BLOCK_SIZE_KV + MESH_X_TILES - 1) / MESH_X_TILES)
+#define PRJ_TS          ((SEQ_LENGTH + MESH_Y_TILES - 1) / MESH_Y_TILES)
+#define PRJ_THP         ((NUM_HEADS * PROJ_SIZE + MESH_X_TILES - 1) / MESH_X_TILES)
+#define PRJ_TKHP        ((NUM_HEADS * PROJ_SIZE + MESH_Y_TILES - 1) / MESH_Y_TILES)
+#define PRJ_TKS         ((SEQ_LENGTH + MESH_X_TILES - 1) / MESH_X_TILES)
+#define PRJ_TE          ((EMBED_SIZE + MESH_X_TILES - 1) / MESH_X_TILES)
+#define PRJ_L1                                                                                     \
+    (L1_SIZE + 1 -                                                                                 \
+     2 * (4 * ATT_BR * PROJ_SIZE + 6 * PROJ_SIZE * ATT_BC + 3 * ATT_BR * ATT_BC +                  \
+          (5 + MESH_X_TILES) * ATT_BR))
 #define PROJ_KB_E                                                                                  \
-    (EMBED_SIZE % 256 == 0 && NUM_HEADS * PROJ_SIZE <= 256 * MESH_X_TILES ? 256                    \
-     : EMBED_SIZE % 128 == 0                                              ? 128                    \
-                                                                          : 64)
+    (EMBED_SIZE % 256 == 0 &&                                                                      \
+             2 * (2 * PRJ_TS * 256 + 4 * 256 * PRJ_THP + 2 * PRJ_TS * PRJ_THP) <= PRJ_L1 &&        \
+             2 * (2 * PRJ_TKHP * 256 + 2 * 256 * PRJ_TKS + PRJ_TKHP * PRJ_TKS) <= PRJ_L1           \
+         ? 256                                                                                     \
+     : EMBED_SIZE % 128 == 0 &&                                                                    \
+             2 * (2 * PRJ_TS * 128 + 4 * 128 * PRJ_THP + 2 * PRJ_TS * PRJ_THP) <= PRJ_L1 &&        \
+             2 * (2 * PRJ_TKHP * 128 + 2 * 128 * PRJ_TKS + PRJ_TKHP * PRJ_TKS) <= PRJ_L1           \
+         ? 128                                                                                     \
+         : 64)
 #define PROJ_KB_HP                                                                                 \
-    ((NUM_HEADS * PROJ_SIZE) % 256 == 0 ? 256 : (NUM_HEADS * PROJ_SIZE) % 128 == 0 ? 128 : 64)
+    ((NUM_HEADS * PROJ_SIZE) % 256 == 0 &&                                                         \
+             2 * (2 * PRJ_TS * 256 + 2 * 256 * PRJ_TE + PRJ_TS * PRJ_TE) <= PRJ_L1                 \
+         ? 256                                                                                     \
+     : (NUM_HEADS * PROJ_SIZE) % 128 == 0 &&                                                       \
+             2 * (2 * PRJ_TS * 128 + 2 * 128 * PRJ_TE + PRJ_TS * PRJ_TE) <= PRJ_L1                 \
+         ? 128                                                                                     \
+         : 64)
 
 /** L1 kernel (CORE): all pointers are L1 addresses. */
 extern void l1_rowmax_fp16_spatz(uint32_t m, uint32_t x, uint32_t p0, uint32_t p1);
