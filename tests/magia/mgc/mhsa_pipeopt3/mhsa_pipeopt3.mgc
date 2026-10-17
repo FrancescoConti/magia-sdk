@@ -17,11 +17,11 @@ wq_  = l2("wq_inp",  (E, H * P), fp16)
 wkt_ = l2("wkt_inp", (H * P, E), fp16)  # Wk transposed
 wv_  = l2("wv_inp",  (E, H * P), fp16)
 wo_  = l2("wo_inp",  (H * P, E), fp16)
-# Q and V head-major, head h in rows h * S:(h + 1) * S, so that the Flat-Attention loads are contiguous;
-# Kt head h in rows h * P:(h + 1) * P; O with the heads side by side, head h in columns h * P:(h + 1) * P
-q_   = l2("q_l2",    (H * S, P), fp16)
+# Q, V and O with the heads side by side, head h in columns h * P:(h + 1) * P (any NUM_HEADS on any mesh:
+# the projection blocks of a tile may straddle heads); Kt head h in rows h * P:(h + 1) * P
+q_   = l2("q_l2",    (S, H * P), fp16)
 kt_  = l2("kt_l2",   (H * P, S), fp16)
-v_   = l2("v_l2",    (H * S, P), fp16)
+v_   = l2("v_l2",    (S, H * P), fp16)
 o_   = l2("o_l2",    (S, H * P), fp16)
 y_   = l2("y_out",   (S, E),     fp16)
 y_gold = l2("y_gold", (S, E),    fp16)  # golden
@@ -29,9 +29,10 @@ y_gold = l2("y_gold", (S, E),    fp16)  # golden
 WAIT_MODE = define(WFE)
 S_BLOCK_SIZE_Q  = define(512)
 S_BLOCK_SIZE_KV = define(512)
-# rows (Q/V and output projections) or columns (Kt projection) of a tile's block computed per RedMulE job
-PROJ_CHUNK_Y = define("(SEQ_LENGTH / MESH_Y_TILES < 64 ? SEQ_LENGTH / MESH_Y_TILES : 64)")
-PROJ_CHUNK_X = define("(SEQ_LENGTH / MESH_X_TILES < 64 ? SEQ_LENGTH / MESH_X_TILES : 64)")
+# reduction block of the projections (output-static, one RedMulE job per block): over EMBED_SIZE for Q/Kt/V,
+# over NUM_HEADS * PROJ_SIZE for the output projection; the largest of 256/128/64 that divides it
+PROJ_KB_E  = define("(EMBED_SIZE % 256 == 0 ? 256 : EMBED_SIZE % 128 == 0 ? 128 : 64)")
+PROJ_KB_HP = define("((NUM_HEADS * PROJ_SIZE) % 256 == 0 ? 256 : (NUM_HEADS * PROJ_SIZE) % 128 == 0 ? 128 : 64)")
 
 # Implemented in src/kernels.c, synchronous on the tile's CV32 core.
 # Merged Spatz kernels from kernels/ (the softmax scale 1/sqrt(PROJ_SIZE) is folded into the exp):
@@ -63,7 +64,7 @@ def main():
     """
     Multi-head self-attention, Y = concat_h(softmax(Q_h @ Kt_h / sqrt(P)) @ V_h) @ Wo, in four
     steps through L2: Q = X @ Wq and V = X @ Wv, Kt = Wk^T @ X^T (output-static on RedMulE, the
-    weight block resident in L1 and the rows / columns of X streamed), the Flat-Attention of every
+    output block resident in L1 and blocks of the reduction dimension streamed), the Flat-Attention of every
     head in one software pipeline (as flat_attn_pipeopt3), Y = O @ Wo (as the Q/V projection).
     """
     for ii, jj in tiles():
@@ -76,9 +77,9 @@ def main():
         tiles_i = ii.split(S_BLOCK_SIZE_Q)
         tiles_j = jj.split(S_BLOCK_SIZE_KV)
 
-        q  = L1.multi_buffer(q_[tiles_i, :])
+        q  = L1.multi_buffer(q_[tiles_i, 0:P])
         kt = L1.multi_buffer(kt_[0:P, tiles_j])
-        v  = L1.multi_buffer(v_[tiles_j, :])
+        v  = L1.multi_buffer(v_[tiles_j, 0:P])
         o  = L1.single_buffer(o_[tiles_i, 0:P])
         attn = L1.multi_buffer((tiles_i, tiles_j), fp16)
         row_max = L1.multi_buffer((tiles_i,), fp16)
@@ -94,83 +95,80 @@ def main():
         Projection buffers, each pinned to its loop: they share L1
         """
 
-        # Q/V projection: tile (ii, jj) owns the block [tile_s x tile_hp] of Q and V (all the heads side by
-        # side), which lies in head hq at columns cq:cq + tile_hp: MESH_X_TILES must be a multiple of NUM_HEADS
+        # Q/V projection: tile (ii, jj) owns the block [tile_s x tile_hp] of Q and V, resident in L1 (output-static),
+        # accumulated over blocks of PROJ_KB_E of the reduction dimension E: X [tile_s x PROJ_KB_E] and
+        # Wq, Wv [PROJ_KB_E x tile_hp] streamed
         tile_s  = ii.split(S)
         tile_hp = jj.split(H * P)
-        wq  = L1.single_buffer(wq_[:, tile_hp], pin="qv_proj")
-        wv  = L1.single_buffer(wv_[:, tile_hp], pin="qv_proj")
-        xqv = L1.multi_buffer(x_[0:PROJ_CHUNK_Y, :], pin="qv_proj")
-        yq  = L1.multi_buffer(q_[0:PROJ_CHUNK_Y, 0:tile_hp.size], pin="qv_proj")
-        yv  = L1.multi_buffer(v_[0:PROJ_CHUNK_Y, 0:tile_hp.size], pin="qv_proj")
+        xqv = L1.multi_buffer(x_[tile_s, 0:PROJ_KB_E], pin="qv_proj")
+        wq  = L1.multi_buffer(wq_[0:PROJ_KB_E, tile_hp], pin="qv_proj")
+        wv  = L1.multi_buffer(wv_[0:PROJ_KB_E, tile_hp], pin="qv_proj")
+        yq  = L1.single_buffer(q_[tile_s, tile_hp], pin="qv_proj")
+        yv  = L1.single_buffer(v_[tile_s, tile_hp], pin="qv_proj")
 
-        # Kt projection: tile (ii, jj) owns the block [tile_khp x tile_ks] of Kt
+        # Kt projection: tile (ii, jj) owns the block [tile_khp x tile_ks] of Kt, accumulated in the same way over
+        # Wk^T [tile_khp x PROJ_KB_E] and X^T [PROJ_KB_E x tile_ks]
         tile_khp = ii.split(H * P)
         tile_ks  = jj.split(S)
-        wk = L1.single_buffer(wkt_[tile_khp, :], pin="k_proj")
-        xk = L1.multi_buffer(xt_[:, 0:PROJ_CHUNK_X], pin="k_proj")
-        yk = L1.multi_buffer(kt_[tile_khp, 0:PROJ_CHUNK_X], pin="k_proj")
+        wk = L1.multi_buffer(wkt_[tile_khp, 0:PROJ_KB_E], pin="k_proj")
+        xk = L1.multi_buffer(xt_[0:PROJ_KB_E, tile_ks], pin="k_proj")
+        yk = L1.single_buffer(kt_[tile_khp, tile_ks], pin="k_proj")
 
-        # output projection: tile (ii, jj) owns the block [tile_s x tile_e] of Y
+        # output projection: tile (ii, jj) owns the block [tile_s x tile_e] of Y, accumulated over blocks of
+        # PROJ_KB_HP of the reduction dimension H * P
         tile_e = jj.split(E)
-        wo = L1.single_buffer(wo_[:, tile_e], pin="o_proj")
-        xo = L1.multi_buffer(o_[0:PROJ_CHUNK_Y, :], pin="o_proj")
-        yo = L1.multi_buffer(y_[0:PROJ_CHUNK_Y, tile_e], pin="o_proj")
+        xo = L1.multi_buffer(o_[tile_s, 0:PROJ_KB_HP], pin="o_proj")
+        wo = L1.multi_buffer(wo_[0:PROJ_KB_HP, tile_e], pin="o_proj")
+        yo = L1.single_buffer(y_[tile_s, tile_e], pin="o_proj")
 
         # start together, as the flat_attn_* tests do
         sync(GLOBAL)
 
         """
-        STEP 1: Q = X @ Wq, V = X @ Wv, chunk c + 1 of X loading and chunk c - 1 of Q, V storing while RedMulE works on chunk c
+        STEP 1: Q = X @ Wq, V = X @ Wv, block k + 1 of X, Wq, Wv loading while RedMulE accumulates block k
         """
 
-        ewq = idma.load(wq, wq_[:, tile_hp])
-        ewv = idma.load(wv, wv_[:, tile_hp])
-        ewq.wait()
-        ewv.wait()
-        n_qv: u16 = tile_s.size // PROJ_CHUNK_Y
+        n_kb_e: u16 = E // PROJ_KB_E
         # one event per job: the two jobs of an iteration are queued together
         ev_q = redmule.events()
         ev_v = redmule.events()
-        for c in pipeline(n_qv, name="qv_proj"):
+        for k in pipeline(n_kb_e, name="qv_proj"):
             with stage(0):
-                r0: u16 = tile_s.start + c * PROJ_CHUNK_Y
-                ex = idma.load(xqv[c], x_[r0:r0 + PROJ_CHUNK_Y, :])
-            with stage(2):
-                r2: u16 = (tile_hp.start // P) * S + tile_s.start + c * PROJ_CHUNK_Y
-                cq: u16 = tile_hp.start % P
-                esq = idma.store(q_[r2:r2 + PROJ_CHUNK_Y, cq:cq + tile_hp.size], yq[c])
-                esv = idma.store(v_[r2:r2 + PROJ_CHUNK_Y, cq:cq + tile_hp.size], yv[c])
+                k0: u16 = k * PROJ_KB_E
+                ex  = idma.load(xqv[k], x_[tile_s, k0:k0 + PROJ_KB_E])
+                ewq = idma.load(wq[k], wq_[k0:k0 + PROJ_KB_E, tile_hp])
+                ewv = idma.load(wv[k], wv_[k0:k0 + PROJ_KB_E, tile_hp])
             with stage(1):
                 ex.wait()
-                redmule.enqueue(xqv[c], wq, yq[c], op=MATMUL, event=ev_q[c])
+                ewq.wait()
+                ewv.wait()
+                redmule.enqueue(xqv[k], wq[k], yq, op=GEMM, event=ev_q[k], uninit=k == 0)
                 redmule.commit_start()
-                redmule.enqueue(xqv[c], wv, yv[c], op=MATMUL, event=ev_v[c])
+                redmule.enqueue(xqv[k], wv[k], yv, op=GEMM, event=ev_v[k], uninit=k == 0)
                 redmule.commit_start()
-                ev_q[c].wait()
-                ev_v[c].wait()
-            with stage(2):
-                esq.wait()
-                esv.wait()
+                ev_q[k].wait()
+                ev_v[k].wait()
+        esq = idma.store(q_[tile_s, tile_hp], yq)
+        esv = idma.store(v_[tile_s, tile_hp], yv)
+        esq.wait()
+        esv.wait()
 
         """
-        STEP 2: Kt = Wk^T @ X^T, by chunks of columns as step 1
+        STEP 2: Kt = Wk^T @ X^T, as step 1
         """
 
-        idma.load(wk, wkt_[tile_khp, :]).wait()
-        n_k: u16 = tile_ks.size // PROJ_CHUNK_X
-        for c in pipeline(n_k, name="k_proj"):
+        for k in pipeline(n_kb_e, name="k_proj"):
             with stage(0):
-                c0: u16 = tile_ks.start + c * PROJ_CHUNK_X
-                ex = idma.load(xk[c], xt_[:, c0:c0 + PROJ_CHUNK_X])
-            with stage(2):
-                c2: u16 = tile_ks.start + c * PROJ_CHUNK_X
-                es = idma.store(kt_[tile_khp, c2:c2 + PROJ_CHUNK_X], yk[c])
+                k0: u16 = k * PROJ_KB_E
+                ew = idma.load(wk[k], wkt_[tile_khp, k0:k0 + PROJ_KB_E])
+                ex = idma.load(xk[k], xt_[k0:k0 + PROJ_KB_E, tile_ks])
             with stage(1):
+                ew.wait()
                 ex.wait()
-                redmule.matmul(wk, xk[c], yk[c]).wait()
-            with stage(2):
-                es.wait()
+                jk = redmule.enqueue(wk[k], xk[k], yk, op=GEMM, uninit=k == 0)
+                redmule.commit_start()
+                jk.wait()
+        idma.store(kt_[tile_khp, tile_ks], yk).wait()
 
         # Q, Kt, V complete in L2
         sync(GLOBAL)
@@ -265,19 +263,18 @@ def main():
                 # head of iteration it, and first row of the slice of Q / O and of K / V owned by this tile in its
                 # blocks
                 hp_start: u16 = (it // s_block_nb_h) * P
-                s_start_q:  u16 = (it // s_block_nb_h) * S + ((it // s_block_nb_kv) % s_block_nb_q) * s_block_size_q + tiles_i.start
+                s_start_q:  u16 = ((it // s_block_nb_kv) % s_block_nb_q) * s_block_size_q + tiles_i.start
                 s_start_kv: u16 = (it % s_block_nb_kv) * s_block_size_kv + tiles_j.start
-                sh_start_kv: u16 = (it // s_block_nb_h) * S + s_start_kv
 
                 # load Q (every iteration: the next Q block is loaded while the previous one is still used), K
                 # and V of the head on the first column / first row / last row of tiles, so that the three
                 # multicasts start from different tiles; each tile has size [Stile x P] (transposed for Kt)
                 if jj==0:
-                    eq = idma.load(q[it], q_[s_start_q:s_start_q + tiles_i.size, :])
+                    eq = idma.load(q[it], q_[s_start_q:s_start_q + tiles_i.size, hp_start:hp_start + P])
                 if ii==0:
                     ekt = idma.load(kt[it], kt_[hp_start:hp_start + P, s_start_kv:s_start_kv + tiles_j.size])
                 if ii==MESH_Y_TILES - 1:
-                    ev = idma.load(v[it], v_[sh_start_kv:sh_start_kv + tiles_j.size, :])
+                    ev = idma.load(v[it], v_[s_start_kv:s_start_kv + tiles_j.size, hp_start:hp_start + P])
                 if jj==0:
                     eq.wait()
                 if ii==0:
@@ -362,20 +359,19 @@ def main():
         STEP 4: Y = O @ Wo, as step 1
         """
 
-        idma.load(wo, wo_[:, tile_e]).wait()
-        n_o: u16 = tile_s.size // PROJ_CHUNK_Y
-        for c in pipeline(n_o, name="o_proj"):
+        n_kb_hp: u16 = (H * P) // PROJ_KB_HP
+        for k in pipeline(n_kb_hp, name="o_proj"):
             with stage(0):
-                r0: u16 = tile_s.start + c * PROJ_CHUNK_Y
-                ex = idma.load(xo[c], o_[r0:r0 + PROJ_CHUNK_Y, :])
-            with stage(2):
-                r2: u16 = tile_s.start + c * PROJ_CHUNK_Y
-                es = idma.store(y_[r2:r2 + PROJ_CHUNK_Y, tile_e], yo[c])
+                k0: u16 = k * PROJ_KB_HP
+                ex = idma.load(xo[k], o_[tile_s, k0:k0 + PROJ_KB_HP])
+                ew = idma.load(wo[k], wo_[k0:k0 + PROJ_KB_HP, tile_e])
             with stage(1):
                 ex.wait()
-                redmule.matmul(xo[c], wo, yo[c]).wait()
-            with stage(2):
-                es.wait()
+                ew.wait()
+                jo = redmule.enqueue(xo[k], wo[k], yo, op=GEMM, uninit=k == 0)
+                redmule.commit_start()
+                jo.wait()
+        idma.store(y_[tile_s, tile_e], yo).wait()
 
         # check the whole output on tile (0, 0), once every tile has written its blocks
         sync(GLOBAL)
