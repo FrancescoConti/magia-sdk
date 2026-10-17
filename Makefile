@@ -150,6 +150,8 @@ GVSOC2PERFETTO_INCLUDE ?= (?x) \
   | magia-noc\.(req|rsp|wide)_router_\d+_\d+\.req(_size)?$$ \
   | magia-noc\.ni_\d+_\d+\.(narrow_req|wide_req)$$ \
   | L2-mem\.(req_addr|req_size|req_is_write)$$
+# Extra converter arguments (shell-quoted), e.g. --pc-in/--or/--keep to reduce the trace to a few bits
+GVSOC2PERFETTO_EXTRA   ?=
 
 .PHONY: gvsoc build format run_profiling gvsoc2perfetto clean rtl-clean set_mesh
 
@@ -301,7 +303,7 @@ endif
 		--split-asm \
 		--symbolize $(CMAKE_BUILDDIR)/bin/$(test).s \
 		--stats \
-		--include '$(GVSOC2PERFETTO_INCLUDE)' > $(GVSOC_WORK_DIR)/gvsoc2perfetto.log 2>&1 & conv=$$!; \
+		--include '$(GVSOC2PERFETTO_INCLUDE)' $(GVSOC2PERFETTO_EXTRA) > $(GVSOC_WORK_DIR)/gvsoc2perfetto.log 2>&1 & conv=$$!; \
 	$(GVRUN) --target=$(GVRUN_TARGET) --param binary=$(BIN_ABS_PATH)/$(test) $(GVRUN_PROFILE_ARGS) $(PROFILE_TILE_ARG) $(GVSOC_TRACE_ARG); \
 	rc=$$?; : <> $(GVSOC2PERFETTO_VCD); wait $$conv && [ $$rc -eq 0 ]; rc=$$?; \
 	cat $(GVSOC_WORK_DIR)/gvsoc2perfetto.log; rm -f -- $(GVSOC2PERFETTO_VCD); exit $$rc
