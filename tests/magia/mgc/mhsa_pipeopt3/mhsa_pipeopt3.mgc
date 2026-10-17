@@ -30,8 +30,10 @@ WAIT_MODE = define(WFE)
 S_BLOCK_SIZE_Q  = define(512)
 S_BLOCK_SIZE_KV = define(512)
 # reduction block of the projections (output-static, one RedMulE job per block): over EMBED_SIZE for Q/Kt/V,
-# over NUM_HEADS * PROJ_SIZE for the output projection; the largest of 256/128/64 that divides it
-PROJ_KB_E  = define("(EMBED_SIZE % 256 == 0 ? 256 : EMBED_SIZE % 128 == 0 ? 128 : 64)")
+# over NUM_HEADS * PROJ_SIZE for the output projection; the largest of 256/128/64 that divides it. For Q/V,
+# 256 only up to 256 columns of Q/V per tile: the double-buffered Wq, Wv blocks would not fit L1 beyond
+# (e.g. ViT-H on a 4x4 mesh)
+PROJ_KB_E  = define("(EMBED_SIZE % 256 == 0 && NUM_HEADS * PROJ_SIZE <= 256 * MESH_X_TILES ? 256 : EMBED_SIZE % 128 == 0 ? 128 : 64)")
 PROJ_KB_HP = define("((NUM_HEADS * PROJ_SIZE) % 256 == 0 ? 256 : (NUM_HEADS * PROJ_SIZE) % 128 == 0 ? 128 : 64)")
 
 # Implemented in src/kernels.c, synchronous on the tile's CV32 core.

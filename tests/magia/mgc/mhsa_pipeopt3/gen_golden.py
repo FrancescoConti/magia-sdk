@@ -40,6 +40,9 @@ parser.add_argument('--block_kv', type=int, default=512)  # S_BLOCK_SIZE_KV in t
 parser.add_argument('--tiles', type=int, nargs='+', default=[2, 4, 8, 16])
 parser.add_argument('--q_std', type=float, default=1.15)  # std of Q and K, as U(-2, 2) in flat_attn.py
 parser.add_argument('--seed', type=int, default=42)
+# place the L2 arrays in the .l2ext section (above the default gvsoc L2: run with l2_size >= 0x10000000), by
+# default only if they do not fit the 15 MiB of the default data region (with some room for the rest)
+parser.add_argument('--l2ext', choices=['auto', 'yes', 'no'], default='auto')
 parser.add_argument('--inc_dir', type=str,
                     default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'include'))
 args = parser.parse_args()
@@ -148,6 +151,11 @@ for mesh_x in args.tiles:
     print("Max FP16 bit distance w.r.t. float64 reference: ",
           hex(np.abs(Y[mesh_x].view('H').astype(np.int32) - f16(ref).view('H').astype(np.int32)).max()))
 
+l2_bytes = 2 * (4 * s_size * e_size + 4 * e_size * hp_size + 4 * s_size * hp_size)
+l2ext = args.l2ext == 'yes' or (args.l2ext == 'auto' and l2_bytes > 12 * 2**20)
+print("\nL2 arrays: %.1f MiB, %s" % (l2_bytes / 2**20, 'in .l2ext (needs l2_size >= 0x10000000)' if l2ext
+                                    else 'in the default data region'))
+
 os.makedirs(args.inc_dir, exist_ok=True)
 with open(os.path.join(args.inc_dir, 'test.h'), 'w') as f:
     f.write('// Copyright 2026 ETH Zurich, University of Bologna and Fondazione Chips-IT.\n')
@@ -169,25 +177,32 @@ with open(os.path.join(args.inc_dir, 'test.h'), 'w') as f:
     f.write('#define PROJ_SIZE  (%d)\n' % p_size)
     f.write('#define NUM_HEADS  (%d)\n' % n_heads)
     f.write('\n')
-    write_fp16_array(f, 'x_inp  [SEQ_LENGTH * EMBED_SIZE]', X)
-    write_fp16_array(f, 'xt_inp [EMBED_SIZE * SEQ_LENGTH]', Xt)
-    write_fp16_array(f, 'wq_inp [EMBED_SIZE * NUM_HEADS * PROJ_SIZE]', Wq)
-    write_fp16_array(f, 'wkt_inp[NUM_HEADS * PROJ_SIZE * EMBED_SIZE]', Wkt)
-    write_fp16_array(f, 'wv_inp [EMBED_SIZE * NUM_HEADS * PROJ_SIZE]', Wv)
-    write_fp16_array(f, 'wo_inp [NUM_HEADS * PROJ_SIZE * EMBED_SIZE]', Wo)
+    if l2ext:
+        f.write('// %.1f MiB of L2 arrays: in .l2ext, above the default L2 (build and run gvsoc with\n' % (l2_bytes / 2**20))
+        f.write('// l2_size >= 0x10000000)\n')
+        f.write('#define L2EXT __attribute__((section(".l2ext")))\n')
+    else:
+        f.write('#define L2EXT\n')
+    f.write('\n')
+    write_fp16_array(f, 'x_inp  [SEQ_LENGTH * EMBED_SIZE] L2EXT', X)
+    write_fp16_array(f, 'xt_inp [EMBED_SIZE * SEQ_LENGTH] L2EXT', Xt)
+    write_fp16_array(f, 'wq_inp [EMBED_SIZE * NUM_HEADS * PROJ_SIZE] L2EXT', Wq)
+    write_fp16_array(f, 'wkt_inp[NUM_HEADS * PROJ_SIZE * EMBED_SIZE] L2EXT', Wkt)
+    write_fp16_array(f, 'wv_inp [EMBED_SIZE * NUM_HEADS * PROJ_SIZE] L2EXT', Wv)
+    write_fp16_array(f, 'wo_inp [NUM_HEADS * PROJ_SIZE * EMBED_SIZE] L2EXT', Wo)
     # intermediates, written by the test
-    f.write('uint16_t q_l2 [SEQ_LENGTH * NUM_HEADS * PROJ_SIZE] __attribute__((aligned(64))) = {0};\n')
-    f.write('uint16_t kt_l2[NUM_HEADS * PROJ_SIZE * SEQ_LENGTH] __attribute__((aligned(64))) = {0};\n')
-    f.write('uint16_t v_l2 [SEQ_LENGTH * NUM_HEADS * PROJ_SIZE] __attribute__((aligned(64))) = {0};\n')
-    f.write('uint16_t o_l2 [SEQ_LENGTH * NUM_HEADS * PROJ_SIZE] __attribute__((aligned(64))) = {0};\n')
-    f.write('uint16_t y_out[SEQ_LENGTH * EMBED_SIZE] __attribute__((aligned(64))) = {0};\n')
+    f.write('uint16_t q_l2 [SEQ_LENGTH * NUM_HEADS * PROJ_SIZE] L2EXT __attribute__((aligned(64))) = {0};\n')
+    f.write('uint16_t kt_l2[NUM_HEADS * PROJ_SIZE * SEQ_LENGTH] L2EXT __attribute__((aligned(64))) = {0};\n')
+    f.write('uint16_t v_l2 [SEQ_LENGTH * NUM_HEADS * PROJ_SIZE] L2EXT __attribute__((aligned(64))) = {0};\n')
+    f.write('uint16_t o_l2 [SEQ_LENGTH * NUM_HEADS * PROJ_SIZE] L2EXT __attribute__((aligned(64))) = {0};\n')
+    f.write('uint16_t y_out[SEQ_LENGTH * EMBED_SIZE] L2EXT __attribute__((aligned(64))) = {0};\n')
     f.write('\n')
     # one golden per mesh side, selected by MESH_X_TILES
     f.write('#include "addr_map/tile_config.h"\n')
     f.write('\n')
     for i, mesh_x in enumerate(args.tiles):
         f.write('#%s MESH_X_TILES == %d\n' % ('if' if i == 0 else 'elif', mesh_x))
-        write_fp16_array(f, 'y_gold[SEQ_LENGTH * EMBED_SIZE]', Y[mesh_x])
+        write_fp16_array(f, 'y_gold[SEQ_LENGTH * EMBED_SIZE] L2EXT', Y[mesh_x])
     f.write('#else\n')
     f.write('#error "no y_gold for this MESH_X_TILES, regenerate with mhsa_pipeopt3/gen_golden.py --tiles"\n')
     f.write('#endif\n')

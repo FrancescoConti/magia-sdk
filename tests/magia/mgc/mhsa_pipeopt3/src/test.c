@@ -18,7 +18,10 @@
 #define WAIT_MODE       WFE
 #define S_BLOCK_SIZE_Q  512
 #define S_BLOCK_SIZE_KV 512
-#define PROJ_KB_E       (EMBED_SIZE % 256 == 0 ? 256 : EMBED_SIZE % 128 == 0 ? 128 : 64)
+#define PROJ_KB_E                                                                                  \
+    (EMBED_SIZE % 256 == 0 && NUM_HEADS * PROJ_SIZE <= 256 * MESH_X_TILES ? 256                    \
+     : EMBED_SIZE % 128 == 0                                              ? 128                    \
+                                                                          : 64)
 #define PROJ_KB_HP                                                                                 \
     ((NUM_HEADS * PROJ_SIZE) % 256 == 0 ? 256 : (NUM_HEADS * PROJ_SIZE) % 128 == 0 ? 128 : 64)
 

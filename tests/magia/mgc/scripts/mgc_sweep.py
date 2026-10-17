@@ -39,11 +39,12 @@ parameters take each test's default), e.g.
 or a single group from the command line:
     tests/magia/mgc/scripts/mgc_sweep.py --tests unfused_attn flat_attn_pipeopt3 --tiles 2 4 [--S 512 1024 ...]
     tests/magia/mgc/scripts/mgc_sweep.py --sweep sweep.json [--out DIR] [--jobs J] [--dry-run] [--keep-traces]
-                                         [--no-profile] [--timeout SEC]
+                                         [--no-profile] [--timeout SEC] [--l2-size BYTES]
 --no-profile still runs make run_profiling, but gvsoc2perfetto reduces the trace to 5 bits per tile
 (CV32, Spatz, RedMulE, iDMA in and out busy) plus tile 0's entry in main: VFU% is N/A, and each run's
 (small) perfetto trace is kept in runs/<id>/. --timeout kills a simulation that does not end
-(status TIMEOUT).
+(status TIMEOUT). --l2-size builds and runs gvsoc with a larger L2 (make l2_size=...), needed by tests whose
+golden generator places the L2 arrays in .l2ext (see targets/magia/link.ld).
     tests/magia/mgc/scripts/mgc_sweep.py --list
 
 Output in --out: summary.log (human-readable table), results.csv (one row per run, plain
@@ -365,10 +366,15 @@ def slot_dirs(out, slot):
     return os.path.join(d, 'build'), os.path.join(d, 'gvsoc_work')
 
 
-def build_gvsoc(tiles, logf):
+def l2_size_opt(args):
+    """make option for the gvsoc L2 size (--l2-size), or ''."""
+    return ' l2_size=%s' % args.l2_size if args.l2_size else ''
+
+
+def build_gvsoc(tiles, logf, args):
     """gvsoc is built for one mesh side: rebuild it whenever tiles changes."""
     # gvsoc2perfetto too, so that parallel run_profiling do not race to build it
-    cmd = 'make gvsoc tiles=%d pulp_cluster=0 && make gvsoc2perfetto' % tiles
+    cmd = 'make gvsoc tiles=%d pulp_cluster=0%s && make gvsoc2perfetto' % (tiles, l2_size_opt(args))
     rc, out = make(cmd)
     write(logf, '$ ' + cmd + '\n' + out)
     return rc
@@ -383,8 +389,8 @@ def build_test(test, tiles, build, logf):
 
 
 def run_test(test, tiles, build, work, logf, args):
-    cmd = ('make run_profiling platform=gvsoc tiles=%d test=%s pulp_cluster=0 CMAKE_BUILDDIR=%s GVSOC_WORK_DIR=%s'
-           % (tiles, test.target, build, work))
+    cmd = ('make run_profiling platform=gvsoc tiles=%d test=%s pulp_cluster=0 CMAKE_BUILDDIR=%s GVSOC_WORK_DIR=%s%s'
+           % (tiles, test.target, build, work, l2_size_opt(args)))
     env = {}
     if args.no_profile:  # through the environment: the Makefile's ?= defaults give way
         main = symbols(test, build)['main']
@@ -754,6 +760,8 @@ def main():
                          'per tile and tile 0\'s entry in main: VFU%% N/A, the small perfetto trace is kept '
                          'in runs/<id>/')
     ap.add_argument('--timeout', type=int, help='kill a simulation after this many seconds (status TIMEOUT)')
+    ap.add_argument('--l2-size', help='gvsoc L2 size (make l2_size=..., e.g. 0x10000000), for tests with data in '
+                    '.l2ext above the default L2 (mhsa_pipeopt3 with more than 12 MiB of L2 arrays)')
     ap.add_argument('--trace-processor', metavar='BIN',
                     help='perfetto trace_processor_shell to use (default: the perfetto package\'s own, or '
                          'v47.0 on hosts with glibc < 2.34)')
@@ -827,7 +835,7 @@ def main():
                 wait(futures)  # the running jobs use the current gvsoc
                 rep.log('  building gvsoc for tiles=%d...' % tiles)
                 gvsoc_tiles = tiles
-                gvsoc_rc = build_gvsoc(tiles, os.path.join(out, 'gvsoc_tiles%d.log' % tiles))
+                gvsoc_rc = build_gvsoc(tiles, os.path.join(out, 'gvsoc_tiles%d.log' % tiles), args)
             if why:
                 row['status'] = 'SKIP'
                 rep.log('  skipped: ' + why)
