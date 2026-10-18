@@ -17,7 +17,7 @@ Y = l2("y_inp", (M, K), fp16)  # bias in, result out
 Z = l2("z_out", (M, K), fp16)  # golden
 
 N_ITERATIONS = define(1)
-N_TIMESLOTS = define(8)
+T_SIZE = define(64)  # reduction (N) rows per timeslot, N_SIZE / T_SIZE timeslots
 WAIT_MODE = define(WFE)
 
 
@@ -41,14 +41,14 @@ def main():
         tile_w = x_id.split(K)
 
         """
-        1a. Set the t_size, how many timeslots we want to divide the temporal dimension into.
+        1a. Set the t_size, the size of the timeslots we divide the temporal dimension into.
         The final L1 memory requirement will be:
         Input data-tile: (tile_h x t_size) * data_dim
         Weight data-tile: (t_size x tile_w) * data_dim
         Output data-tile: ((tile_h x tile_w) * data_dim)
         """
-        timeslots: u8 = N_TIMESLOTS
-        t_size: u8 = N // timeslots
+        t_size: u16 = T_SIZE
+        timeslots: u16 = N // t_size
 
         """
         2. Static output data-tile, resident in L1 for the whole test.

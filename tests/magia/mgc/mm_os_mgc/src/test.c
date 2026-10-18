@@ -15,7 +15,7 @@
 #include "mg_event.h"
 
 #define N_ITERATIONS 1
-#define N_TIMESLOTS  8
+#define T_SIZE       64
 #define WAIT_MODE    WFE
 
 /**
@@ -72,14 +72,14 @@ int main(void)
     }
 
     /**
-     * 1a. Set the t_size, how many timeslots we want to divide the temporal dimension into.
+     * 1a. Set the t_size, the size of the timeslots we divide the temporal dimension into.
      * The final L1 memory requirement will be:
      * Input data-tile: (tile_h x t_size) * data_dim
      * Weight data-tile: (t_size x tile_w) * data_dim
      * Output data-tile: ((tile_h x tile_w) * data_dim)
      */
-    uint8_t timeslots = N_TIMESLOTS;
-    uint8_t t_size    = N_SIZE / timeslots;
+    uint16_t t_size    = T_SIZE;
+    uint16_t timeslots = N_SIZE / t_size;
 
     /**
      * 2. Static output data-tile, resident in L1 for the whole test.

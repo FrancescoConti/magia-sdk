@@ -17,7 +17,8 @@ side simulate in parallel, each with its own CMAKE_BUILDDIR and GVSOC_WORK_DIR (
 and gvsoc_work/, the others in <out>/jobs/<k>/); builds stay serial, as they share the test
 sources. Metrics:
   - cycles: from tile 0's entry in main to the exit of the last tile other than tile 0, i.e.
-    without crt0 init and without tile 0's final check()
+    without crt0 init and without tile 0's final check(); for mm tests, where each tile checks
+    its own output tile, to the end of the last iDMA store (L1->L2)
   - MAC/cycle: matmul MACs only / cycles: M*N*K*N_ITERATIONS for mm, 2*S*S*P for attention
     (Q @ Kt and Attn @ V of one head, softmax counts 0), 2*S*S*P*H + 4*S*D*P*H for mhsa (all heads,
     plus the Q, Kt, V and output projections)
@@ -25,8 +26,8 @@ sources. Metrics:
     busy (L2->L1, L1->L2, either), Spatz running a task or its VFU active, and empty cycles
     (none of them busy: CV32 alone, or CV32 asleep waiting for an event)
 
-Parameters (S, D, P, H from include/test.h, S_BLOCK_SIZE_Q/KV from the .mgc) default to the
-test's own; any other value regenerates test.h (golden generators) and src/test.c (mgcc) in
+Parameters (S, D, P, H, M, N, K from include/test.h, S_BLOCK_SIZE_Q/KV, T_SIZE from the .mgc)
+default to the test's own (mm tests: M, N, K and T_SIZE, settable for those with a gen_golden.py); any other value regenerates test.h (golden generators) and src/test.c (mgcc) in
 place. The test sources are restored at the end (also on Ctrl-C, or on the next start if the
 script was killed). D and H are written to test.h but not used by the current attention kernels.
 
@@ -86,9 +87,10 @@ SWEEP_DIR = os.path.join(REPO, 'mgc_sweep')
 BACKUP = os.path.join(SWEEP_DIR, '.backup')
 CYCLE_NS = 5  # gvsoc clock: 200 MHz, perfetto timestamps in ns
 
-PARAMS = ['S', 'D', 'P', 'H', 'S_BLOCK_SIZE_Q', 'S_BLOCK_SIZE_KV']
-HEADER_DEFINES = {'S': 'SEQ_LENGTH', 'D': 'EMBED_SIZE', 'P': 'PROJ_SIZE', 'H': 'NUM_HEADS'}
-MGC_DEFINES = ['S_BLOCK_SIZE_Q', 'S_BLOCK_SIZE_KV']
+PARAMS = ['S', 'D', 'P', 'H', 'S_BLOCK_SIZE_Q', 'S_BLOCK_SIZE_KV', 'M', 'N', 'K', 'T_SIZE']
+HEADER_DEFINES = {'S': 'SEQ_LENGTH', 'D': 'EMBED_SIZE', 'P': 'PROJ_SIZE', 'H': 'NUM_HEADS',
+                  'M': 'M_SIZE', 'N': 'N_SIZE', 'K': 'K_SIZE'}
+MGC_DEFINES = ['S_BLOCK_SIZE_Q', 'S_BLOCK_SIZE_KV', 'T_SIZE']
 # Only the gvsoc events analyze() reads (make's defaults dump ~20x more: asm, NoC, L2, ...),
 # as POSIX basic regexes for gvsoc and as a regex of the gvsoc2perfetto tracks they become
 # (CV32 PC of tile 0 only, for its entry in main: one change per cycle of a spinning core)
@@ -123,7 +125,8 @@ CSV_COLUMNS = [
 TABLE = [
     ('id', 'run_id', '{}'), ('test', 'test', '{}'), ('tiles', 'tiles', '{}'), ('S', 'S', '{}'),
     ('D', 'D', '{}'), ('P', 'P', '{}'), ('H', 'H', '{}'), ('BQ', 'S_BLOCK_SIZE_Q', '{}'),
-    ('BKV', 'S_BLOCK_SIZE_KV', '{}'), ('status', 'status', '{}'), ('cycles', 'cycles', '{:,}'),
+    ('BKV', 'S_BLOCK_SIZE_KV', '{}'), ('M', 'M', '{}'), ('N', 'N', '{}'), ('K', 'K', '{}'),
+    ('T', 'T_SIZE', '{}'), ('status', 'status', '{}'), ('cycles', 'cycles', '{:,}'),
     ('MAC/cyc', 'mac_per_cycle', '{:.1f}'), ('MAC/cyc/tile', 'mac_per_cycle_per_tile', '{:.2f}'),
     ('RedMulE%', 'redmule_pct', '{:.1f}'), ('iDMA%', 'idma_pct', '{:.1f}'),
     ('in%', 'idma_in_pct', '{:.1f}'), ('out%', 'idma_out_pct', '{:.1f}'),
@@ -158,6 +161,7 @@ class Test:
         self.spatz_name = m.group(1) if m else None
         self.header = os.path.join(self.dir, 'include', 'test.h')
         self.test_c = os.path.join(self.dir, 'src', 'test.c')
+        self.gen = os.path.join(self.dir, 'gen_golden.py')
         self.mgc = os.path.join(self.dir, name + '.mgc')
         if not os.path.exists(self.mgc):
             self.mgc = sorted(glob.glob(os.path.join(self.dir, '*.mgc')))[0]
@@ -182,10 +186,8 @@ class Test:
             m = re.search(r'^%s\s*=\s*define\((\d+)\)' % p, src, re.M)
             d[p] = int(m.group(1)) if m else None
         if self.kind == 'mm':
-            self.mnk = {k: int(re.search(r'#define\s+%s\s+\(?(\d+)\)?' % k, h).group(1))
-                        for k in ('M_SIZE', 'N_SIZE', 'K_SIZE')}
             m = re.search(r'^N_ITERATIONS\s*=\s*define\((\d+)\)', src, re.M)
-            self.mnk['N_ITERATIONS'] = int(m.group(1)) if m else 1
+            self.n_iterations = int(m.group(1)) if m else 1
         return d
 
     def applicable(self):
@@ -194,8 +196,7 @@ class Test:
 
     def macs(self, cfg):
         if self.kind == 'mm':
-            k = self.mnk
-            return k['M_SIZE'] * k['N_SIZE'] * k['K_SIZE'] * k['N_ITERATIONS']
+            return cfg['M'] * cfg['N'] * cfg['K'] * self.n_iterations
         # Q @ Kt and Attn @ V, S*S*P each; flat_attn computes a single head (H is not used)
         if self.kind != 'mhsa':
             return 2 * cfg['S'] * cfg['S'] * cfg['P']
@@ -205,8 +206,14 @@ class Test:
 
     def check(self, cfg, tiles):
         """Reason why (cfg, tiles) cannot run, or None."""
-        if self.kind == 'mm' and any(cfg[p] != self.defaults[p] for p in self.applicable()):
-            return 'mm tests run with their default sizes only'
+        if self.kind == 'mm' and not os.path.exists(self.gen) and any(
+                cfg[p] != self.defaults[p] for p in self.applicable()):
+            return 'mm tests without a gen_golden.py run with their default sizes only'
+        if self.kind == 'mm':
+            if cfg['M'] % tiles or cfg['K'] % tiles:
+                return 'M and K must be multiples of tiles'
+            if cfg['T_SIZE'] and (cfg['N'] % cfg['T_SIZE'] or cfg['N'] // cfg['T_SIZE'] < 2):
+                return 'N must be a multiple of T_SIZE, at least 2 timeslots'
         if self.kind in ('flat_attn', 'mhsa'):
             S, bq, bkv = cfg['S'], cfg['S_BLOCK_SIZE_Q'], cfg['S_BLOCK_SIZE_KV']
             if tiles & (tiles - 1):
@@ -283,8 +290,11 @@ def generate(test, cfg, tiles, args, srcs, log):
     for p in (test.header, test.test_c, test.mgc):
         shutil.copy2(srcs.saved[p], p)
 
-    key = '%s_S%s_D%s_P%s_H%s_KV%s_T%d' % (test.kind, cfg['S'], cfg['D'], cfg['P'], cfg['H'],
-                                          cfg['S_BLOCK_SIZE_KV'], tiles)
+    if test.kind == 'mm':
+        key = '%s_M%s_N%s_K%s' % (test.name, cfg['M'], cfg['N'], cfg['K'])
+    else:
+        key = '%s_S%s_D%s_P%s_H%s_KV%s_T%d' % (test.kind, cfg['S'], cfg['D'], cfg['P'], cfg['H'],
+                                              cfg['S_BLOCK_SIZE_KV'], tiles)
     cache = os.path.join(args.cache, key)
     cached = os.path.join(cache, 'test.h')
     if not os.path.exists(cached):
@@ -296,6 +306,8 @@ def generate(test, cfg, tiles, args, srcs, log):
             cmd = [args.gen_python, gen, '--s_size', cfg['S'], '--e_size', cfg['D'],
                    '--p_size', cfg['P'], '--n_heads', cfg['H'], '--block_kv', cfg['S_BLOCK_SIZE_KV'],
                    '--tiles', tiles, '--inc_dir', cache]
+        elif test.kind == 'mm':
+            cmd = [args.gen_python, test.gen, '--m', cfg['M'], '--n', cfg['N'], '--k', cfg['K'], '--inc_dir', cache]
         else:
             # writes the test's own include/test.h (restored at the end)
             cmd = [args.gen_python, os.path.join(test.dir, 'gen_golden.py'),
@@ -539,6 +551,10 @@ def analyze(test, trace, kills, n_tiles, build, light, tp_bin=None):
                           % tracks[(0, 'cv32-core.function')])).as_pandas_dataframe().t[0]
         others = [c for t, c in kills.items() if t != 0] or list(kills.values())
         lo, hi = int(main0), max(others) * CYCLE_NS
+        if test.kind == 'mm':
+            # every tile checks its own output tile after storing it: end at the last store
+            stores = [slices(t, 'idma-obi2axi.be.busy') for t in range(n_tiles)]
+            hi = min(hi, max(int(s[:, 1].max()) for s in stores if len(s)))
 
         # Spatz busy: Snitch PC outside the runtime's idle code (dispatcher, traps, boot)
         idle, (base, end) = spatz_idle_pcs(test, build) if test.spatz_name else ([], (0, 0))
