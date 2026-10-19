@@ -25,10 +25,7 @@
 #define PRJ_TKHP        ((NUM_HEADS * PROJ_SIZE + MESH_Y_TILES - 1) / MESH_Y_TILES)
 #define PRJ_TKS         ((SEQ_LENGTH + MESH_X_TILES - 1) / MESH_X_TILES)
 #define PRJ_TE          ((EMBED_SIZE + MESH_X_TILES - 1) / MESH_X_TILES)
-#define PRJ_L1                                                                                     \
-    (L1_SIZE + 1 -                                                                                 \
-     2 * (4 * ATT_BR * PROJ_SIZE + 6 * PROJ_SIZE * ATT_BC + 3 * ATT_BR * ATT_BC +                  \
-          (5 + MESH_X_TILES) * ATT_BR))
+#define PRJ_L1          (L1_SIZE + 1)
 #define PROJ_KB_E                                                                                  \
     (EMBED_SIZE % 256 == 0 &&                                                                      \
              2 * (2 * PRJ_TS * 256 + 4 * 256 * PRJ_THP + 2 * PRJ_TS * PRJ_THP) <= PRJ_L1 &&        \
@@ -113,7 +110,8 @@ int main(void)
     uint32_t l1_tile_base = get_l1_base(hartid);
 
     /**
-     * Flat-Attention buffers, used by other tiles: not pinned, below the projection buffers
+     * Flat-Attention buffers, pinned to their loop although used by other tiles: the sync(GLOBAL)
+     * around the loop keeps the other tiles out of them while this one runs the projections
      */
     // spatial sharding of each Q block [Br x P] over the rows and of each K/V block [Bc x P] over
     // the columns
@@ -212,7 +210,7 @@ int main(void)
     uint32_t len_xqv       = PROJ_KB_E * 2;
     uint32_t std_xqv       = EMBED_SIZE * 2;
     uint32_t reps_xqv      = (uint32_t)tile_s;
-    uint32_t l1_addr_xqv_0 = l1_addr_o_tree_recv_buf + (tiles_i_max * PROJ_SIZE * 2);
+    uint32_t l1_addr_xqv_0 = (l1_tile_base);
     uint32_t l1_addr_xqv_1 = l1_addr_xqv_0 + (tile_s_max * PROJ_KB_E * 2);
     uint32_t l2_addr_xqv   = (uint32_t)x_inp + (tile_s_max * ii * EMBED_SIZE * 2);
     uint32_t len_wq        = tile_hp * 2;
@@ -265,7 +263,7 @@ int main(void)
     uint32_t len_wk       = PROJ_KB_E * 2;
     uint32_t std_wk       = EMBED_SIZE * 2;
     uint32_t reps_wk      = (uint32_t)tile_khp;
-    uint32_t l1_addr_wk_0 = l1_addr_o_tree_recv_buf + (tiles_i_max * PROJ_SIZE * 2);
+    uint32_t l1_addr_wk_0 = (l1_tile_base);
     uint32_t l1_addr_wk_1 = l1_addr_wk_0 + (tile_khp_max * PROJ_KB_E * 2);
     uint32_t l2_addr_wk   = (uint32_t)wkt_inp + (tile_khp_max * ii * EMBED_SIZE * 2);
     uint32_t len_xk       = tile_ks * 2;
@@ -298,7 +296,7 @@ int main(void)
     uint32_t len_xo       = PROJ_KB_HP * 2;
     uint32_t std_xo       = NUM_HEADS * PROJ_SIZE * 2;
     uint32_t reps_xo      = (uint32_t)tile_s;
-    uint32_t l1_addr_xo_0 = l1_addr_o_tree_recv_buf + (tiles_i_max * PROJ_SIZE * 2);
+    uint32_t l1_addr_xo_0 = (l1_tile_base);
     uint32_t l1_addr_xo_1 = l1_addr_xo_0 + (tile_s_max * PROJ_KB_HP * 2);
     uint32_t l2_addr_xo   = (uint32_t)o_l2 + (tile_s_max * ii * NUM_HEADS * PROJ_SIZE * 2);
     uint32_t len_wo       = tile_e * 2;

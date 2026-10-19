@@ -38,9 +38,9 @@ PRJ_THP  = define("((NUM_HEADS * PROJ_SIZE + MESH_X_TILES - 1) / MESH_X_TILES)")
 PRJ_TKHP = define("((NUM_HEADS * PROJ_SIZE + MESH_Y_TILES - 1) / MESH_Y_TILES)")
 PRJ_TKS  = define("((SEQ_LENGTH + MESH_X_TILES - 1) / MESH_X_TILES)")
 PRJ_TE   = define("((EMBED_SIZE + MESH_X_TILES - 1) / MESH_X_TILES)")
-# L1 bytes left to the projection buffers (which share L1) above the Flat-Attention ones: q x2, o, o_tree_recv_buf
-# [ATT_BR x P], kt x2, v x4 [P x ATT_BC], attn x3 [ATT_BR x ATT_BC], row_max x3, row_sum x2, row_gather_buf
-PRJ_L1   = define("(L1_SIZE + 1 - 2 * (4 * ATT_BR * PROJ_SIZE + 6 * PROJ_SIZE * ATT_BC + 3 * ATT_BR * ATT_BC + (5 + MESH_X_TILES) * ATT_BR))")
+# L1 bytes of the projection buffers: all the L1, as every buffer is pinned to its loop (the Flat-Attention ones
+# too, so the projections share L1 with them)
+PRJ_L1   = define("(L1_SIZE + 1)")
 # reduction block of the projections (output-static, one RedMulE job per block): over EMBED_SIZE for Q/Kt/V,
 # over NUM_HEADS * PROJ_SIZE for the output projection; the largest of 256/128/64 that divides it and whose
 # buffers (double-buffered input blocks, resident output block) fit PRJ_L1 (64 is not checked: the output
@@ -84,26 +84,27 @@ def main():
     for ii, jj in tiles():
 
         """
-        Flat-Attention buffers, used by other tiles: not pinned, below the projection buffers
+        Flat-Attention buffers, pinned to their loop although used by other tiles: the sync(GLOBAL) around the
+        loop keeps the other tiles out of them while this one runs the projections
         """
 
         # spatial sharding of each Q block [Br x P] over the rows and of each K/V block [Bc x P] over the columns
         tiles_i = ii.split(S_BLOCK_SIZE_Q)
         tiles_j = jj.split(S_BLOCK_SIZE_KV)
 
-        q  = L1.multi_buffer(q_[tiles_i, 0:P])
-        kt = L1.multi_buffer(kt_[0:P, tiles_j])
-        v  = L1.multi_buffer(v_[tiles_j, 0:P])
-        o  = L1.single_buffer(o_[tiles_i, 0:P])
-        attn = L1.multi_buffer((tiles_i, tiles_j), fp16)
-        row_max = L1.multi_buffer((tiles_i,), fp16)
-        row_sum = L1.multi_buffer((tiles_i,), fp16)
+        q  = L1.multi_buffer(q_[tiles_i, 0:P], pin="attn")
+        kt = L1.multi_buffer(kt_[0:P, tiles_j], pin="attn")
+        v  = L1.multi_buffer(v_[tiles_j, 0:P], pin="attn")
+        o  = L1.single_buffer(o_[tiles_i, 0:P], pin="attn")
+        attn = L1.multi_buffer((tiles_i, tiles_j), fp16, pin="attn")
+        row_max = L1.multi_buffer((tiles_i,), fp16, pin="attn")
+        row_sum = L1.multi_buffer((tiles_i,), fp16, pin="attn")
 
         # row maxima/sums of all the tiles of this row [MESH_X_TILES x Stile]: only used on tile (ii, 0), but every tile
         # allocates it so that the L1 layout is the same everywhere
-        row_gather_buf = L1.single_buffer((MESH_X_TILES, tiles_i), fp16)
+        row_gather_buf = L1.single_buffer((MESH_X_TILES, tiles_i), fp16, pin="attn")
         # receive buffer for the tree reduction of o
-        o_tree_recv_buf = L1.single_buffer((tiles_i, P), fp16)
+        o_tree_recv_buf = L1.single_buffer((tiles_i, P), fp16, pin="attn")
 
         """
         Projection buffers, each pinned to its loop: they share L1
