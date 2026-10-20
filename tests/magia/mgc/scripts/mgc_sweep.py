@@ -298,7 +298,9 @@ def generate(test, cfg, tiles, args, srcs, log):
     if test.kind == 'mm':
         key = '%s_M%s_N%s_K%s' % (test.name, cfg['M'], cfg['N'], cfg['K'])
     else:
-        key = '%s_S%s_D%s_P%s_H%s%s_KV%s_T%d' % (test.kind, cfg['S'], cfg['D'], cfg['P'], cfg['H'],
+        # the flat_attn tests share one generator; mhsa/gqa tests have their own (e.g. the _masked ones)
+        key = '%s_S%s_D%s_P%s_H%s%s_KV%s_T%d' % (test.kind if test.kind == 'flat_attn' else test.name,
+                                                cfg['S'], cfg['D'], cfg['P'], cfg['H'],
                                                 '_HKV%s' % cfg['HKV'] if test.kind == 'gqa' else '',
                                                 cfg['S_BLOCK_SIZE_KV'], tiles)
     cache = os.path.join(args.cache, key)
