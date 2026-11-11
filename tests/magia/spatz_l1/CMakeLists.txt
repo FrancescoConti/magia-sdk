@@ -32,7 +32,7 @@ function(spatz_l1_test K)
   target_include_directories(${TEST_NAME} PRIVATE ${INCS} ${SPATZ_HEADER_DIR})
   target_compile_options(${TEST_NAME} PRIVATE -O2)
   target_link_options(${TEST_NAME} PRIVATE -Wl,--allow-multiple-definition)
-  target_link_libraries(${TEST_NAME} PUBLIC runtime hal)
+  target_link_libraries(${TEST_NAME} PUBLIC runtime hal mglib)
   add_custom_command(
     TARGET ${TEST_NAME}
     POST_BUILD
