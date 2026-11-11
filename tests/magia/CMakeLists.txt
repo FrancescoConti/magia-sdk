@@ -7,3 +7,4 @@
 # Add test
 add_subdirectory(mesh)
 add_subdirectory(mgc)
+add_subdirectory(spatz_l1)
