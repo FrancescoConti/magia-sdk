@@ -23,6 +23,10 @@ MEMORY
     instrram    : ORIGIN = 0xcc000000, LENGTH = 0x8000
     dataram     : ORIGIN = 0xcc010000, LENGTH = 0xF00000  /* MAGIA: data at 0xCC010000 */
     stack       : ORIGIN = 0x00010000, LENGTH = 0x0C000   /* CV32/PULP stacks below Spatz [0x1C000, 0x20000) */
+    /* L2 above the default gvsoc L2 end (and TEST_END, 0xccff0000), up to the largest L2: only
+     * for data placed in .l2ext, which needs a gvsoc built and run with l2_size covering it
+     * (e.g. make ... l2_size=0x10000000 for 0xcd000000-0xd0000000) */
+    l2ext       : ORIGIN = 0xcd000000, LENGTH = 0x32ff0000
 }
 
 /* Stack information variables.
@@ -160,6 +164,13 @@ SECTIONS
         *(COMMON)
         _bss_end = .;
     } > dataram :data
+
+    /* large L2 data, __attribute__((section(".l2ext"))): see l2ext above */
+    .l2ext : {
+        . = ALIGN(64);
+        *(.l2ext)
+        *(.l2ext.*)
+    } > l2ext :l2ext
 
     /* Per-tile-aliased scratch (private to each tile, unlike the shared-L2 .bss).
      * Placed above the stack top so the downward-growing stack never reaches it.
